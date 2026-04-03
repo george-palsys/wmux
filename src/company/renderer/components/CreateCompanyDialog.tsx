@@ -111,25 +111,9 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
   const inputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
 
-  // ── Focus management: inert background, disable xterm textareas, trap focus ──
+  // ── Focus management: disable xterm textareas + initial focus ──
   useEffect(() => {
-    const overlayEl = dialogRef.current?.parentElement;
-    const inertTargets: HTMLElement[] = [];
-
-    if (overlayEl?.parentElement) {
-      Array.from(overlayEl.parentElement.children).forEach((sibling) => {
-        if (
-          sibling !== overlayEl &&
-          sibling instanceof HTMLElement &&
-          !sibling.hasAttribute('inert')
-        ) {
-          sibling.setAttribute('inert', '');
-          inertTargets.push(sibling);
-        }
-      });
-    }
-
-    // Disable xterm helper textareas that may live outside the overlay tree.
+    // Disable xterm helper textareas so they don't steal focus.
     const xtermTextareas = document.querySelectorAll<HTMLTextAreaElement>('.xterm-helper-textarea');
     const xtermPrevStates: { el: HTMLTextAreaElement; disabled: boolean }[] = [];
     xtermTextareas.forEach((ta) => {
@@ -137,15 +121,7 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
       ta.disabled = true;
     });
 
-    // Safety-net: if focus escapes the dialog, pull it back to the name input.
-    const trapFocus = (e: FocusEvent) => {
-      if (dialogRef.current && !dialogRef.current.contains(e.target as Node)) {
-        inputRef.current?.focus();
-      }
-    };
-    document.addEventListener('focusin', trapFocus);
-
-    // Initial focus: rAF + deferred setTimeout to beat xterm's own scheduling.
+    // Initial focus with delay to beat xterm's own scheduling.
     const focusInput = () => inputRef.current?.focus();
     let deferredTimer: ReturnType<typeof setTimeout> | undefined;
     const raf = requestAnimationFrame(() => {
@@ -154,9 +130,7 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
     });
 
     return () => {
-      inertTargets.forEach((el) => el.removeAttribute('inert'));
       xtermPrevStates.forEach(({ el, disabled }) => { el.disabled = disabled; });
-      document.removeEventListener('focusin', trapFocus);
       cancelAnimationFrame(raf);
       if (deferredTimer !== undefined) clearTimeout(deferredTimer);
     };

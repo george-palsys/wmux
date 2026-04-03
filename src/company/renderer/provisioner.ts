@@ -95,102 +95,121 @@ export interface SpawnCompanyOpts {
 
 export async function spawnCompany(opts: SpawnCompanyOpts): Promise<void> {
   const { companyName, skipPermissions, workDir, departments } = opts;
-  const store = useStore.getState();
   const permFlag = skipPermissions ? ' --dangerously-skip-permissions' : '';
   const cwdArg = workDir || undefined;
 
-  // Build org chart for CEO prompt
+  // ── Phase 1: Populate store immediately (sidebar shows org chart right away) ──
+  const g = useStore.getState;
+  for (const dept of departments) {
+    g().addDepartment(dept.name, dept.leadName);
+    const co = g().company;
+    if (!co) continue;
+    const deptObj = co.departments[co.departments.length - 1];
+    if (!deptObj) continue;
+    for (const mem of dept.members) {
+      g().addMember(deptObj.id, mem.name, mem.preset as AgentPreset, mem.customAgentPath);
+    }
+  }
+
+  // ── Phase 2: Build org chart for prompts ──
   const orgLines = departments.map(
     (d) => `[${d.name}] Lead: ${d.leadName} / Members: ${d.members.map((m) => `${m.name}(${m.preset})`).join(', ')}`,
   );
   const orgChart = orgLines.join(' | ') || 'No departments yet';
 
-  // ── 1. Spawn CEO ──────────────────────────────────────────────────────────
-  const ceoPrompt = [
-    `You are the CEO of "${companyName}".`,
-    `Organization: ${orgChart}.`,
-    `Your job: 1) Assign tasks to department leads. 2) Review results from leads. 3) Make final decisions.`,
-    `Communication: Use the wmux CLI tool (Bash) to send messages:`,
-    `- Send task: wmux company message --from "CEO" --to "DeptName" "task description"`,
-    `- Broadcast: wmux company message --from "CEO" --broadcast "announcement"`,
-    `- You will RECEIVE messages in your terminal as "━━━ WMUX MESSAGE ━━━" blocks.`,
-    `- When leads request approval, respond via: wmux company message --from "CEO" --to "DeptName" "APPROVED" or "REJECTED: reason"`,
-    `IMPORTANT: Always use the wmux CLI to send messages. Do NOT output [WMUX-MSG] text directly.`,
-  ].join(' ');
-
-  const { workspaceId: ceoWsId } = await spawnAgentWorkspace(
-    `${companyName} — CEO`, `claude${permFlag}`, 'ceo', undefined, ceoPrompt, cwdArg,
-  );
-  store.setCeoWorkspace(ceoWsId);
-
-  // ── 2. Spawn departments ──────────────────────────────────────────────────
-  for (const dept of departments) {
-    store.addDepartment(dept.name, dept.leadName);
-
-    const memberNames = dept.members.map((m) => `${m.name}(${m.preset})`).join(', ');
-    const otherDepts = departments.filter((d) => d.name !== dept.name).map((d) => d.name).join(', ') || 'none';
-
-    // ── Lead prompt & spawn ─────────────────────────────────────────────────
-    const leadPrompt = [
-      `You are the ${dept.leadName.replace(/-/g, ' ')}, leading the ${dept.name} department of "${companyName}".`,
-      `Your team members: ${memberNames}.`,
-      `Other departments: ${otherDepts}.`,
+  // ── Phase 3: Spawn CEO ──
+  try {
+    const ceoPrompt = [
+      `You are the CEO of "${companyName}".`,
+      `Organization: ${orgChart}.`,
+      `Your job: 1) Assign tasks to department leads. 2) Review results from leads. 3) Make final decisions.`,
       `Communication: Use the wmux CLI tool (Bash) to send messages:`,
-      `- Assign task to member: wmux company message --from "${dept.name} Lead" --to "MemberName" "task"`,
-      `- Report to CEO: wmux company message --from "${dept.name}" --to "CEO" "result summary"`,
-      `- You RECEIVE messages as "━━━ WMUX MESSAGE ━━━" blocks in your terminal.`,
-      `Members run in plan mode — review their plans and approve before they execute.`,
-      `Workflow: 1) Receive CEO task. 2) Decompose into subtasks. 3) Assign via wmux CLI. 4) Review member plans. 5) Consolidate and report to CEO.`,
+      `- Send task: wmux company message --from "CEO" --to "DeptName" "task description"`,
+      `- Broadcast: wmux company message --from "CEO" --broadcast "announcement"`,
+      `- You will RECEIVE messages in your terminal as "━━━ WMUX MESSAGE ━━━" blocks.`,
+      `- When leads request approval, respond via: wmux company message --from "CEO" --to "DeptName" "APPROVED" or "REJECTED: reason"`,
       `IMPORTANT: Always use the wmux CLI to send messages. Do NOT output [WMUX-MSG] text directly.`,
     ].join(' ');
 
-    const { workspaceId: leadWsId, ptyId: leadPtyId } = await spawnAgentWorkspace(
-      `${dept.name} — ${dept.leadName}`, `claude --teammate-mode auto${permFlag}`, 'lead', dept.name, leadPrompt, cwdArg,
+    const { workspaceId: ceoWsId } = await spawnAgentWorkspace(
+      `${companyName} — CEO`, `claude${permFlag}`, 'ceo', undefined, ceoPrompt, cwdArg,
     );
+    g().setCeoWorkspace(ceoWsId);
+  } catch (err) {
+    console.error('Failed to spawn CEO:', err);
+  }
 
-    // Link lead to store
-    const state1 = useStore.getState();
-    const deptObj = state1.company?.departments.find((d) => d.name === dept.name);
-    const lead = deptObj?.members.find((m) => m.id === deptObj?.leadId);
-    if (lead) {
-      state1.setMemberWorkspace(lead.id, leadWsId);
-      state1.setMemberPty(lead.id, leadPtyId);
-    }
+  // ── Phase 4: Spawn leads and members (each wrapped in try-catch) ──
+  for (const dept of departments) {
+    const memberNames = dept.members.map((m) => `${m.name}(${m.preset})`).join(', ');
+    const otherDepts = departments.filter((d) => d.name !== dept.name).map((d) => d.name).join(', ') || 'none';
 
-    // ── Members ─────────────────────────────────────────────────────────────
-    for (const mem of dept.members) {
-      const s = useStore.getState();
-      s.addMember(deptObj?.id || '', mem.name, mem.preset as AgentPreset, mem.customAgentPath);
+    // Find the stored department
+    const deptObj = g().company?.departments.find((d) => d.name === dept.name);
+    if (!deptObj) continue;
 
-      const teammates = dept.members.filter((m2) => m2.name !== mem.name).map((m2) => `${m2.name}(${m2.preset})`).join(', ') || 'none';
-      const memPrompt = [
-        `You are ${mem.name}, the ${mem.preset.replace(/-/g, ' ')} in the ${dept.name} department of "${companyName}".`,
-        `Your lead: ${dept.leadName}. Your teammates: ${teammates}.`,
+    // ── Spawn Lead ──
+    try {
+      const leadPrompt = [
+        `You are the ${dept.leadName.replace(/-/g, ' ')}, leading the ${dept.name} department of "${companyName}".`,
+        `Your team members: ${memberNames}.`,
+        `Other departments: ${otherDepts}.`,
         `Communication: Use the wmux CLI tool (Bash) to send messages:`,
-        `- Report completion: wmux company message --from "${mem.name}" --to "${dept.name} Lead" "DONE: summary"`,
-        `- Report blockers: wmux company message --from "${mem.name}" --to "${dept.name} Lead" "BLOCKED: reason"`,
-        `- You RECEIVE tasks as "━━━ WMUX MESSAGE ━━━" blocks in your terminal.`,
-        `You are in PLAN MODE. Create a plan first, then wait for your lead to approve before executing.`,
+        `- Assign task to member: wmux company message --from "${dept.name} Lead" --to "MemberName" "task"`,
+        `- Report to CEO: wmux company message --from "${dept.name}" --to "CEO" "result summary"`,
+        `- You RECEIVE messages as "━━━ WMUX MESSAGE ━━━" blocks in your terminal.`,
+        `Members run in plan mode — review their plans and approve before they execute.`,
+        `Workflow: 1) Receive CEO task. 2) Decompose into subtasks. 3) Assign via wmux CLI. 4) Review member plans. 5) Consolidate and report to CEO.`,
         `IMPORTANT: Always use the wmux CLI to send messages. Do NOT output [WMUX-MSG] text directly.`,
       ].join(' ');
 
-      const { workspaceId: memWsId, ptyId: memPtyId } = await spawnAgentWorkspace(
-        `${dept.name} — ${mem.name}`, `claude --teammate-mode auto${permFlag}`, 'member', dept.name, memPrompt, cwdArg,
+      const { workspaceId: leadWsId, ptyId: leadPtyId } = await spawnAgentWorkspace(
+        `${dept.name} — ${dept.leadName}`, `claude --teammate-mode auto${permFlag}`, 'lead', dept.name, leadPrompt, cwdArg,
       );
 
-      // Link member to store
-      const s2 = useStore.getState();
-      const deptObj2 = s2.company?.departments.find((d) => d.name === dept.name);
-      const member = deptObj2?.members[deptObj2.members.length - 1];
-      if (member) {
-        s2.setMemberWorkspace(member.id, memWsId);
-        s2.setMemberPty(member.id, memPtyId);
+      const lead = g().company?.departments.find((d) => d.id === deptObj.id)?.members.find((m) => m.id === deptObj.leadId);
+      if (lead) {
+        g().setMemberWorkspace(lead.id, leadWsId);
+        g().setMemberPty(lead.id, leadPtyId);
       }
+    } catch (err) {
+      console.error(`Failed to spawn lead for ${dept.name}:`, err);
+    }
 
-      // Enter plan mode after 8s
-      setTimeout(() => {
-        void window.electronAPI.pty.write(memPtyId, '/plan\r');
-      }, 8000);
+    // ── Spawn Members ──
+    const storedMembers = g().company?.departments.find((d) => d.id === deptObj.id)?.members.filter((m) => m.id !== deptObj.leadId) ?? [];
+
+    for (let i = 0; i < dept.members.length; i++) {
+      const mem = dept.members[i];
+      const storedMember = storedMembers[i];
+      if (!storedMember) continue;
+
+      try {
+        const teammates = dept.members.filter((m2) => m2.name !== mem.name).map((m2) => `${m2.name}(${m2.preset})`).join(', ') || 'none';
+        const memPrompt = [
+          `You are ${mem.name}, the ${mem.preset.replace(/-/g, ' ')} in the ${dept.name} department of "${companyName}".`,
+          `Your lead: ${dept.leadName}. Your teammates: ${teammates}.`,
+          `Communication: Use the wmux CLI tool (Bash) to send messages:`,
+          `- Report completion: wmux company message --from "${mem.name}" --to "${dept.name} Lead" "DONE: summary"`,
+          `- Report blockers: wmux company message --from "${mem.name}" --to "${dept.name} Lead" "BLOCKED: reason"`,
+          `- You RECEIVE tasks as "━━━ WMUX MESSAGE ━━━" blocks in your terminal.`,
+          `You are in PLAN MODE. Create a plan first, then wait for your lead to approve before executing.`,
+          `IMPORTANT: Always use the wmux CLI to send messages. Do NOT output [WMUX-MSG] text directly.`,
+        ].join(' ');
+
+        const { workspaceId: memWsId, ptyId: memPtyId } = await spawnAgentWorkspace(
+          `${dept.name} — ${mem.name}`, `claude --teammate-mode auto${permFlag}`, 'member', dept.name, memPrompt, cwdArg,
+        );
+
+        g().setMemberWorkspace(storedMember.id, memWsId);
+        g().setMemberPty(storedMember.id, memPtyId);
+
+        setTimeout(() => {
+          void window.electronAPI.pty.write(memPtyId, '/plan\r');
+        }, 8000);
+      } catch (err) {
+        console.error(`Failed to spawn member ${mem.name}:`, err);
+      }
     }
   }
 }
