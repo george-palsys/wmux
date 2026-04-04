@@ -52,15 +52,20 @@ export async function spawnAgentWorkspace(
   cwd?: string,
   workUnit?: import('../types').WorkUnit,
 ): Promise<{ workspaceId: string; ptyId: string; paneId: string }> {
-  // 1. Create PTY
-  const { id: ptyId } = await window.electronAPI.pty.create(cwd ? { cwd } : undefined);
-
-  // 2. Build workspace with surface
-  const surface = createSurface(ptyId, 'Terminal', cwd || '');
-  const rootPane = createLeafPane(surface);
+  // 1. Generate workspaceId first so we can pass it to PTY for identity resolution
   const workspaceId = generateId('ws');
 
-  // 3. Add workspace to store
+  // 2. Create PTY with workspaceId for WMUX_WORKSPACE_ID env var + PID map
+  const { id: ptyId } = await window.electronAPI.pty.create({
+    ...(cwd ? { cwd } : {}),
+    workspaceId,
+  });
+
+  // 3. Build workspace with surface
+  const surface = createSurface(ptyId, 'Terminal', cwd || '');
+  const rootPane = createLeafPane(surface);
+
+  // 4. Add workspace to store
   useStore.setState((state) => {
     state.workspaces.push({
       id: workspaceId,
