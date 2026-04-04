@@ -244,14 +244,16 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
           Template
         </label>
         <div
-          className="grid gap-2 mb-4"
+          className="grid gap-2 mb-5"
           style={{ gridTemplateColumns: '1fr 1fr' }}
         >
-          {DIALOG_TEMPLATES.map((entry) => {
+          {DIALOG_TEMPLATES.map((entry, idx) => {
             const isSelected = selectedId === entry.id;
             const isHovered = hoveredId === entry.id;
             const depts = entry.template.departments;
             const totalAgents = depts.reduce((sum, d) => sum + d.members.length + 1, 0);
+            // Last item in odd-length list spans full width
+            const isLastOdd = DIALOG_TEMPLATES.length % 2 === 1 && idx === DIALOG_TEMPLATES.length - 1;
 
             return (
               <button
@@ -262,7 +264,9 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
                 onMouseEnter={() => setHoveredId(entry.id)}
                 onMouseLeave={() => setHoveredId(null)}
                 style={{
+                  gridColumn: isLastOdd ? '1 / -1' : undefined,
                   padding: '12px 14px',
+                  minHeight: isLastOdd ? undefined : 110,
                   backgroundColor: isSelected
                     ? 'rgba(137, 180, 250, 0.08)'
                     : 'var(--bg-mantle)',
@@ -336,7 +340,7 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
         {/* ── Mini org chart preview ── */}
         {selectedEntry && selectedEntry.template.departments.length > 0 && (
           <div
-            className="mb-4 rounded-lg px-4 py-3"
+            className="mb-5 rounded-lg px-4 py-3"
             style={{
               backgroundColor: 'var(--bg-mantle)',
               border: '1px solid var(--bg-surface)',
@@ -419,7 +423,7 @@ export default function CreateCompanyDialog({ onConfirm, onCancel }: CreateCompa
 
         {/* ── Step 3: Options ── */}
         <div
-          className="mb-4 rounded-lg px-4 py-3"
+          className="mb-5 rounded-lg px-4 py-3"
           style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
         >
           <div
