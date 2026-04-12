@@ -141,7 +141,7 @@ function spawnDaemon(): Promise<number> {
     // Without this guard, early polls connect to a zombie Windows named pipe
     // left by a crashed predecessor, wasting time on 1s timeouts.
     let attempts = 0;
-    const maxAttempts = 75; // 75 * 200ms = 15 seconds
+    const maxAttempts = 300; // 300 * 50ms = 15 seconds
     let pinging = false; // prevent concurrent pings
 
     const poll = setInterval(async () => {
@@ -183,7 +183,7 @@ function spawnDaemon(): Promise<number> {
         clearInterval(poll);
         reject(new Error('Daemon spawned but not responding after 15 seconds'));
       }
-    }, 200);
+    }, 50);
   });
 }
 

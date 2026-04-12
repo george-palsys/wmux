@@ -260,6 +260,12 @@ export default function AppLayout() {
   }, []);
 
   // 앱 시작 시 세션 복원
+  // reconcile은 daemon:connected 이벤트를 기다린 후 실행한다.
+  // 이전에는 session.load() 직후 바로 reconcilePtys()를 호출했는데,
+  // 데몬이 아직 연결 안 된 상태에서 pty.list()가 로컬(빈 배열)로 가면서
+  // 이전 세션을 모두 새 PTY로 덮어쓰는 버그가 있었음.
+  const reconcileScheduledRef = useRef(false);
+
   useEffect(() => {
     window.electronAPI.session.load().then(async (saved: SessionData | null) => {
       if (!saved) {
@@ -279,19 +285,38 @@ export default function AppLayout() {
         setShowAutoUpdatePrompt(true);
       }
 
-      await reconcilePtys();
+      // Don't reconcile immediately — wait for daemon:connected event.
+      // If daemon connects before timeout, the onConnected handler will reconcile.
+      // If daemon never connects (local PTY mode), the fallback timer reconciles.
+      reconcileScheduledRef.current = true;
     });
   }, []);
 
-  // Re-reconcile when daemon connects late (race condition:
-  // renderer may have already reconciled with empty pty list
-  // before main process finished connecting to daemon).
   useEffect(() => {
-    const remove = window.electronAPI.daemon.onConnected(() => {
-      console.log('[AppLayout] Daemon connected late — re-reconciling PTYs');
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconciled = false;
+
+    const doReconcile = (source: string) => {
+      if (reconciled) return;
+      if (!reconcileScheduledRef.current) return;
+      reconciled = true;
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      console.log(`[AppLayout] Reconciling PTYs (trigger: ${source})`);
       reconcilePtys();
+    };
+
+    const remove = window.electronAPI.daemon.onConnected(() => {
+      doReconcile('daemon:connected');
     });
-    return remove;
+
+    // Fallback: if daemon doesn't connect within 5s, reconcile with
+    // whatever pty backend is available (local PTY mode).
+    fallbackTimer = setTimeout(() => doReconcile('timeout-fallback'), 5000);
+
+    return () => {
+      remove();
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+    };
   }, [reconcilePtys]);
 
   // Save session on beforeunload (with scrollback dump — sync fire-and-forget)

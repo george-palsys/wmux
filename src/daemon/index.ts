@@ -15,8 +15,11 @@ import type { DaemonEvent, DaemonCreateSessionParams, DaemonSessionIdParams, Dae
 const wmuxDir = getWmuxDir();
 
 /** Get a unique identifier for the current OS boot session.
- *  Changes after every reboot, enabling stale PID detection. */
+ *  Changes after every reboot, enabling stale PID detection.
+ *  Result is cached after first call to avoid repeated wmic.exe invocations. */
+let _bootIdCache: string | undefined;
 function getBootId(): string {
+  if (_bootIdCache) return _bootIdCache;
   try {
     if (process.platform === 'win32') {
       const { execFileSync } = require('child_process');
@@ -29,15 +32,16 @@ function getBootId(): string {
         { encoding: 'utf-8', timeout: 5000, windowsHide: true },
       );
       const match = result.match(/LastBootUpTime=(\S+)/);
-      return match ? match[1].trim() : `fallback-${os.uptime()}`;
+      _bootIdCache = match ? match[1].trim() : `fallback-${os.uptime()}`;
     } else {
       // Linux: /proc/sys/kernel/random/boot_id
-      return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
+      _bootIdCache = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
     }
   } catch {
     // Fallback: use uptime (less precise but better than nothing)
-    return `uptime-${Math.floor(os.uptime())}`;
+    _bootIdCache = `uptime-${Math.floor(os.uptime())}`;
   }
+  return _bootIdCache!;
 }
 const PID_FILE = path.join(wmuxDir, 'daemon.pid');
 const LOCK_FILE = path.join(wmuxDir, 'daemon.lock');
@@ -128,10 +132,25 @@ function acquireLock(): boolean {
     fs.closeSync(fd);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-      // Lock file exists — check if the owning process is still alive
+      // Lock file exists — check if the owning process is still alive.
+      // Optimization: if bootId changed (reboot), all old PIDs are stale —
+      // skip the expensive tasklist.exe call entirely.
       try {
         const existingPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
-        if (!isNaN(existingPid) && isProcessRunning(existingPid)) {
+        let stale = false;
+
+        // Fast path: detect reboot via saved state's bootId
+        try {
+          const stateFile = path.join(dir, 'sessions.json');
+          const stateRaw = fs.readFileSync(stateFile, 'utf-8');
+          const savedState = JSON.parse(stateRaw);
+          if (savedState.bootId && savedState.bootId !== getBootId()) {
+            stale = true; // Rebooted — old PID is definitely dead
+            log('info', 'Reboot detected — skipping lock owner process check');
+          }
+        } catch { /* no saved state, fall through to process check */ }
+
+        if (!stale && !isNaN(existingPid) && isProcessRunning(existingPid)) {
           log('error', `Another daemon is already running (PID ${existingPid})`);
           return false;
         }
@@ -200,8 +219,10 @@ async function recoverSessions(
     log('info', `Boot ID changed (${state.bootId} → ${currentBootId}) — reboot detected, skipping PID kills`);
   }
 
-  for (const session of state.sessions) {
-    if (session.state === 'dead') continue;
+  // Recover sessions in parallel — ConPTY spawns are independent and can run concurrently.
+  // This reduces O(n) sequential spawn time to O(1).
+  const recoverOne = async (session: (typeof state.sessions)[number]) => {
+    if (session.state === 'dead') return;
 
     if (session.state === 'suspended' && session.bufferDumpPath) {
       // Attempt to recover suspended session
@@ -250,6 +271,8 @@ async function recoverSessions(
     } else {
       // Non-suspended live session — check for periodic snapshot buf file
       // (written every 30s, survives forced kills / power loss)
+      // Optimization: skip PID kill and wmic isOurShellProcess check when rebooted —
+      // all old PIDs are guaranteed stale after reboot.
       if (!rebooted && await ProcessMonitor.isAlive(session.pid)) {
         // Guard against PID recycling: verify the process is actually
         // the shell we spawned, not an unrelated system process.
@@ -290,7 +313,7 @@ async function recoverSessions(
           recoveredIds.add(session.id);
           changed = true;
           log('info', `Recovered session ${session.id} from snapshot in ${cwd}`);
-          continue;
+          return;
         } catch (err) {
           log('error', `Failed to recover session ${session.id} from snapshot:`, err);
         }
@@ -331,7 +354,9 @@ async function recoverSessions(
         changed = true;
       }
     }
-  }
+  };
+
+  await Promise.all(state.sessions.map(recoverOne));
 
   if (changed) {
     // Build combined state: recovered (live) sessions + dead sessions from loaded state
@@ -592,15 +617,11 @@ function wireEvents(
 
 // === State builder ===
 
-/** Cached boot ID — computed once at startup */
-let cachedBootId: string | undefined;
-
 function buildState(sessionManager: DaemonSessionManager): DaemonState {
-  if (!cachedBootId) cachedBootId = getBootId();
   return {
     version: 1,
     sessions: sessionManager.listSessions(),
-    bootId: cachedBootId,
+    bootId: getBootId(), // cached internally by getBootId()
   };
 }
 
@@ -665,11 +686,10 @@ async function shutdown(
   await Promise.all(dumpPromises);
 
   // Save suspended state BEFORE disposing
-  if (!cachedBootId) cachedBootId = getBootId();
   const suspendState: DaemonState = {
     version: 1,
     sessions: managedSessions.map((m) => ({ ...m.meta })),
-    bootId: cachedBootId,
+    bootId: getBootId(),
   };
   stateWriter.saveImmediate(suspendState);
 
@@ -834,7 +854,7 @@ async function main(): Promise<void> {
             m.meta.bufferDumpPath = dumpPath;
           } catch { /* best effort */ }
         }
-        if (!cachedBootId) cachedBootId = getBootId();
+        const cachedBootId = getBootId();
         const suspendState: DaemonState = {
           version: 1,
           sessions: managed.map((m) => ({ ...m.meta })),
@@ -848,7 +868,16 @@ async function main(): Promise<void> {
   // 10. Uncaught error handlers
   process.on('uncaughtException', (err) => {
     log('error', 'Uncaught exception:', err);
-    doShutdown('uncaughtException');
+    // Don't kill the entire daemon for transient/recoverable errors.
+    // EPIPE/ECONNRESET happen when a client disconnects mid-write;
+    // ERR_STREAM_DESTROYED happens when writing to a closed stream.
+    const code = (err as NodeJS.ErrnoException).code ?? '';
+    const recoverable = ['EPIPE', 'ECONNRESET', 'ECONNABORTED', 'ERR_STREAM_DESTROYED'].includes(code);
+    if (recoverable) {
+      log('warn', `Recoverable uncaught error (${code}) — daemon continues`);
+    } else {
+      doShutdown('uncaughtException');
+    }
   });
   process.on('unhandledRejection', (reason) => {
     log('error', 'Unhandled rejection:', reason);
