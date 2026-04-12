@@ -87,6 +87,27 @@ export class DaemonClient extends EventEmitter {
     this.controlBuffer = '';
   }
 
+  /** Synchronous disconnect — for use in process exit/session-end handlers
+   *  where async operations cannot complete. Destroys all sockets immediately. */
+  disconnectSync(): void {
+    for (const [, socket] of this.sessionPipes) {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+    this.sessionPipes.clear();
+
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      this.pendingRequests.delete(id);
+    }
+
+    if (this.controlPipe) {
+      try { this.controlPipe.destroy(); } catch { /* ignore */ }
+      this.controlPipe = null;
+    }
+    this.connected = false;
+    this.controlBuffer = '';
+  }
+
   /** Send an RPC call over the control pipe. */
   async rpc(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     if (!this.controlPipe || !this.connected) {

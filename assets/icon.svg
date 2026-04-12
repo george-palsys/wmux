@@ -2,17 +2,19 @@
   <!-- Black background -->
   <rect width="256" height="256" fill="#000000"/>
 
-  <!-- White chevron (>) on the left -->
+  <!-- Eye: > (big, left side) -->
   <path d="
-    M 0 0
-    L 108 128
-    L 0 256
-    L 56 256
-    L 164 128
-    L 56 0
-    Z
-  " fill="#FFFFFF"/>
+    M 30 40
+    L 120 128
+    L 30 216
+  " fill="none" stroke="#FFFFFF" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
 
-  <!-- White W in bottom right -->
-  <text x="148" y="240" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="96" fill="#FFFFFF">W</text>
+  <!-- Mouth: w (small, bottom right) -->
+  <path d="
+    M 138 152
+    L 160 208
+    L 184 168
+    L 208 208
+    L 230 152
+  " fill="none" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

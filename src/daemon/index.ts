@@ -13,6 +13,32 @@ import type { DaemonEvent, DaemonCreateSessionParams, DaemonSessionIdParams, Dae
 
 // === Constants ===
 const wmuxDir = getWmuxDir();
+
+/** Get a unique identifier for the current OS boot session.
+ *  Changes after every reboot, enabling stale PID detection. */
+function getBootId(): string {
+  try {
+    if (process.platform === 'win32') {
+      const { execFileSync } = require('child_process');
+      const pathMod = require('path');
+      const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+      const wmic = pathMod.join(systemRoot, 'System32', 'wbem', 'wmic.exe');
+      const result = execFileSync(
+        wmic,
+        ['os', 'get', 'LastBootUpTime', '/value'],
+        { encoding: 'utf-8', timeout: 5000, windowsHide: true },
+      );
+      const match = result.match(/LastBootUpTime=(\S+)/);
+      return match ? match[1].trim() : `fallback-${os.uptime()}`;
+    } else {
+      // Linux: /proc/sys/kernel/random/boot_id
+      return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
+    }
+  } catch {
+    // Fallback: use uptime (less precise but better than nothing)
+    return `uptime-${Math.floor(os.uptime())}`;
+  }
+}
 const PID_FILE = path.join(wmuxDir, 'daemon.pid');
 const LOCK_FILE = path.join(wmuxDir, 'daemon.lock');
 
@@ -47,6 +73,43 @@ function isProcessRunning(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch {
+    return false;
+  }
+}
+
+/** Check if a PID belongs to the shell process we originally spawned.
+ *  Prevents killing unrelated processes after PID recycling (e.g. reboot). */
+function isOurShellProcess(pid: number, expectedCmd: string): boolean {
+  try {
+    const { execFileSync } = require('child_process');
+    if (process.platform === 'win32') {
+      const pathMod = require('path');
+      const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+      const wmic = pathMod.join(systemRoot, 'System32', 'wbem', 'wmic.exe');
+      const result = execFileSync(
+        wmic,
+        ['process', 'where', `ProcessId=${pid}`, 'get', 'ExecutablePath', '/value'],
+        { encoding: 'utf-8', timeout: 3000, windowsHide: true },
+      );
+      // WMIC output: "ExecutablePath=C:\Windows\...\powershell.exe\r\n"
+      const match = result.match(/ExecutablePath=(.+)/i);
+      if (!match) return false;
+      const actualExe = match[1].trim().toLowerCase();
+      const expectedExe = expectedCmd.toLowerCase();
+      // Match if the actual executable path ends with the expected command
+      return actualExe.endsWith(pathMod.basename(expectedExe).toLowerCase()) ||
+             actualExe === expectedExe;
+    } else {
+      // Unix: check /proc/<pid>/exe or use ps
+      const result = execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], {
+        encoding: 'utf-8', timeout: 3000,
+      });
+      const actualCmd = result.trim();
+      const expectedBase = path.basename(expectedCmd);
+      return actualCmd === expectedBase || actualCmd.includes(expectedBase);
+    }
+  } catch {
+    // If we can't determine, err on the side of caution — don't kill
     return false;
   }
 }
@@ -130,6 +193,13 @@ async function recoverSessions(
   let changed = false;
   const recoveredIds = new Set<string>();
 
+  // Detect reboot: if bootId changed, all old PIDs are stale — skip kill attempts
+  const currentBootId = getBootId();
+  const rebooted = state.bootId != null && state.bootId !== currentBootId;
+  if (rebooted) {
+    log('info', `Boot ID changed (${state.bootId} → ${currentBootId}) — reboot detected, skipping PID kills`);
+  }
+
   for (const session of state.sessions) {
     if (session.state === 'dead') continue;
 
@@ -180,8 +250,14 @@ async function recoverSessions(
     } else {
       // Non-suspended live session — check for periodic snapshot buf file
       // (written every 30s, survives forced kills / power loss)
-      if (await ProcessMonitor.isAlive(session.pid)) {
-        try { process.kill(session.pid); } catch { /* ignore */ }
+      if (!rebooted && await ProcessMonitor.isAlive(session.pid)) {
+        // Guard against PID recycling: verify the process is actually
+        // the shell we spawned, not an unrelated system process.
+        if (isOurShellProcess(session.pid, session.cmd)) {
+          try { process.kill(session.pid); } catch { /* ignore */ }
+        } else {
+          log('warn', `PID ${session.pid} is alive but not our shell (${session.cmd}) — skipping kill`);
+        }
       }
 
       const snapshotPath = stateWriter.getBufferDumpPath(session.id);
@@ -516,10 +592,15 @@ function wireEvents(
 
 // === State builder ===
 
+/** Cached boot ID — computed once at startup */
+let cachedBootId: string | undefined;
+
 function buildState(sessionManager: DaemonSessionManager): DaemonState {
+  if (!cachedBootId) cachedBootId = getBootId();
   return {
     version: 1,
     sessions: sessionManager.listSessions(),
+    bootId: cachedBootId,
   };
 }
 
@@ -584,9 +665,11 @@ async function shutdown(
   await Promise.all(dumpPromises);
 
   // Save suspended state BEFORE disposing
+  if (!cachedBootId) cachedBootId = getBootId();
   const suspendState: DaemonState = {
     version: 1,
     sessions: managedSessions.map((m) => ({ ...m.meta })),
+    bootId: cachedBootId,
   };
   stateWriter.saveImmediate(suspendState);
 
@@ -751,9 +834,11 @@ async function main(): Promise<void> {
             m.meta.bufferDumpPath = dumpPath;
           } catch { /* best effort */ }
         }
+        if (!cachedBootId) cachedBootId = getBootId();
         const suspendState: DaemonState = {
           version: 1,
           sessions: managed.map((m) => ({ ...m.meta })),
+          bootId: cachedBootId,
         };
         stateWriter.saveImmediate(suspendState);
       } catch { /* best effort */ }

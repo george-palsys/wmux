@@ -30,6 +30,8 @@ export interface DaemonSession {
 export interface DaemonState {
   version: number;
   sessions: DaemonSession[];
+  /** OS boot ID — used to detect reboot and skip PID-based operations on stale sessions */
+  bootId?: string;
 }
 
 /** Daemon configuration (~/.wmux/config.json) */
