@@ -232,6 +232,8 @@ ipcMain.handle('browser:register-webview', async (_event, surfaceId: string, web
   return { ok: true };
 });
 
+app.setAppUserModelId('com.wmux.app');
+
 console.log('[DEBUG] registering app.on(ready)');
 app.on('ready', async () => {
   console.log('[Main] App ready, creating window...');
