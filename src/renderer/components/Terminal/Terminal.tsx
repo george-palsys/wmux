@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useCallback } from 'react';
 import { useTerminal } from '../../hooks/useTerminal';
 import { useStore } from '../../stores';
 import ViCopyMode from './ViCopyMode';
@@ -25,11 +25,22 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   const containerRef = useRef<HTMLDivElement>(null);
   const [ptyId, setPtyId] = useState<string | null>(externalPtyId || null);
   const creatingRef = useRef(false);
+  const [restoring, setRestoring] = useState(!!scrollbackFile);
 
   const viCopyModeActive = useStore((s) => s.viCopyModeActive);
   const setViCopyModeActive = useStore((s) => s.setViCopyModeActive);
   const searchBarVisible = useStore((s) => s.searchBarVisible);
   const setSearchBarVisible = useStore((s) => s.setSearchBarVisible);
+
+  // Hide restoring overlay when first data arrives
+  const handleFirstData = useCallback(() => setRestoring(false), []);
+
+  // Fallback: hide restoring overlay after 3 seconds even if no data arrives
+  useEffect(() => {
+    if (!restoring) return;
+    const timer = setTimeout(() => setRestoring(false), 3000);
+    return () => clearTimeout(timer);
+  }, [restoring]);
 
   useEffect(() => {
     console.log(`[Terminal] useEffect: externalPtyId=${externalPtyId}, scrollbackFile=${scrollbackFile}`);
@@ -93,7 +104,7 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   // isVisible = workspace is shown AND this surface tab is the active one.
   // useTerminal uses this to skip fit() when the container is display:none.
   const isVisible = isWorkspaceVisible && isActive;
-  const { terminal: terminalRef, findNext, findPrevious, clearSearch } = useTerminal(containerRef, { ptyId, isVisible, scrollbackFile });
+  const { terminal: terminalRef, findNext, findPrevious, clearSearch } = useTerminal(containerRef, { ptyId, isVisible, scrollbackFile, onFirstData: scrollbackFile ? handleFirstData : undefined });
 
   const showViCopyMode = viCopyModeActive && isActive && terminalRef.current !== null;
   const showSearchBar = searchBarVisible && isActive;
@@ -113,6 +124,13 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
         position: 'relative',
       }}
     >
+      {/* Session restore overlay */}
+      {restoring && (
+        <div className="absolute inset-0 flex items-center justify-center text-[var(--text-muted)] text-sm font-mono z-10 pointer-events-none">
+          Restoring session...
+        </div>
+      )}
+
       {/* xterm mount point */}
       <div
         ref={containerRef}
