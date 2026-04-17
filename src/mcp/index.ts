@@ -130,8 +130,10 @@ server.tool(
   {
     url: z.string().optional().describe('Initial URL to load (defaults to google.com)'),
   },
-  async ({ url }) =>
-    callRpc('browser.open', url ? { url } : {}),
+  async ({ url }) => {
+    const workspaceId = await resolveWorkspaceId();
+    return callRpc('browser.open', { ...(url && { url }), ...(workspaceId && { workspaceId }) });
+  },
 );
 
 server.tool(
@@ -161,8 +163,10 @@ server.tool(
   {
     profile: z.string().optional().describe('Profile name to use (defaults to "default")'),
   },
-  async ({ profile }) =>
-    callRpc('browser.session.start', profile ? { profile } : {}),
+  async ({ profile }) => {
+    const workspaceId = await resolveWorkspaceId();
+    return callRpc('browser.session.start', { ...(profile && { profile }), ...(workspaceId && { workspaceId }) });
+  },
 );
 
 server.tool(

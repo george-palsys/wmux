@@ -277,13 +277,25 @@ export class DaemonClient extends EventEmitter {
   private setupSessionPipe(sessionId: string, socket: net.Socket): void {
     let flushed = false;
     let pendingChunks: Buffer[] = [];
+    let pendingBytes = 0;
+    const MAX_PENDING_BYTES = 10 * 1024 * 1024; // 10 MB safety cap
 
     socket.on('data', (chunk: Buffer) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 
       if (!flushed) {
-        // Accumulate until we see the FLUSH_DONE_MARKER
         pendingChunks.push(buf);
+        pendingBytes += buf.length;
+
+        // Prevent unbounded accumulation if flush marker never arrives
+        if (pendingBytes > MAX_PENDING_BYTES) {
+          flushed = true;
+          pendingChunks = [];
+          pendingBytes = 0;
+          return;
+        }
+
+        // Accumulate until we see the FLUSH_DONE_MARKER
         const combined = Buffer.concat(pendingChunks);
         const markerIndex = combined.indexOf(FLUSH_DONE_MARKER);
 
@@ -305,6 +317,7 @@ export class DaemonClient extends EventEmitter {
           }
 
           pendingChunks = [];
+          pendingBytes = 0;
         }
       } else {
         // Real-time mode — emit directly
@@ -313,10 +326,14 @@ export class DaemonClient extends EventEmitter {
     });
 
     socket.on('close', () => {
+      pendingChunks = [];
+      pendingBytes = 0;
       this.sessionPipes.delete(sessionId);
     });
 
     socket.on('error', () => {
+      pendingChunks = [];
+      pendingBytes = 0;
       this.sessionPipes.delete(sessionId);
     });
   }

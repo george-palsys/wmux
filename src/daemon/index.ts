@@ -507,7 +507,15 @@ function registerRpcHandlers(
         managed.ptyProcess.write(data.toString());
       });
 
-      await pipe.start();
+      try {
+        await pipe.start();
+      } catch (err) {
+        managed.bridge.removeListener('data', onData);
+        sessionDataListeners.delete(p.id);
+        sessionPipes.delete(p.id);
+        log('error', `Failed to start session pipe for ${p.id}:`, err);
+        throw err;
+      }
     }
 
     const state = buildState(sessionManager);
@@ -530,7 +538,11 @@ function registerRpcHandlers(
     // Clean up session pipe
     const pipe = sessionPipes.get(p.id);
     if (pipe) {
-      await pipe.stop();
+      try {
+        await pipe.stop();
+      } catch (err) {
+        log('warn', `Failed to stop session pipe for ${p.id}:`, err);
+      }
       sessionPipes.delete(p.id);
     }
 
@@ -866,8 +878,12 @@ async function main(): Promise<void> {
         }
       }
       // Save session metadata after all buffer dumps complete
-      const state = buildState(sessionManager);
-      stateWriter.saveImmediate(state);
+      try {
+        const state = buildState(sessionManager);
+        stateWriter.saveImmediate(state);
+      } catch (err) {
+        log('warn', 'Snapshot state save failed:', err);
+      }
     })().finally(() => {
       snapshotRunning = false;
     });
@@ -914,9 +930,10 @@ async function main(): Promise<void> {
 
   // 10. Uncaught error handlers — with resilience for recoverable errors
   const FATAL_CODES = new Set(['ENOMEM', 'ENOSPC', 'ERR_OUT_OF_RANGE']);
-  const uncaughtErrors: { message: string; time: number }[] = [];
-  const UNCAUGHT_WINDOW_MS = 30_000; // 30-second sliding window
-  const UNCAUGHT_THRESHOLD = 3;      // shutdown after 3 same errors in window
+  const uncaughtErrorCounts = new Map<string, number[]>();
+  const UNCAUGHT_WINDOW_MS = 30_000;
+  const UNCAUGHT_THRESHOLD = 3;
+  const MAX_TRACKED_ERRORS = 50;
 
   process.on('uncaughtException', (err) => {
     log('error', 'Uncaught exception:', err);
@@ -929,20 +946,27 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Track error occurrences within a sliding window
     const now = Date.now();
-    const errKey = err.message || String(err);
-    uncaughtErrors.push({ message: errKey, time: now });
+    const errKey = (err.message || String(err)).slice(0, 200);
 
-    // Prune old entries outside the window
-    while (uncaughtErrors.length > 0 && uncaughtErrors[0].time < now - UNCAUGHT_WINDOW_MS) {
-      uncaughtErrors.shift();
+    let timestamps = uncaughtErrorCounts.get(errKey);
+    if (!timestamps) {
+      if (uncaughtErrorCounts.size >= MAX_TRACKED_ERRORS) {
+        const oldest = uncaughtErrorCounts.keys().next().value!;
+        uncaughtErrorCounts.delete(oldest);
+      }
+      timestamps = [];
+      uncaughtErrorCounts.set(errKey, timestamps);
+    }
+    timestamps.push(now);
+
+    // Prune old timestamps for this error
+    while (timestamps.length > 0 && timestamps[0] < now - UNCAUGHT_WINDOW_MS) {
+      timestamps.shift();
     }
 
-    // Count occurrences of this specific error
-    const count = uncaughtErrors.filter((e) => e.message === errKey).length;
-    if (count >= UNCAUGHT_THRESHOLD) {
-      log('error', `Same uncaught exception repeated ${count} times in ${UNCAUGHT_WINDOW_MS / 1000}s — shutting down`);
+    if (timestamps.length >= UNCAUGHT_THRESHOLD) {
+      log('error', `Same uncaught exception repeated ${timestamps.length} times in ${UNCAUGHT_WINDOW_MS / 1000}s — shutting down`);
       doShutdown('uncaughtException');
     }
   });
