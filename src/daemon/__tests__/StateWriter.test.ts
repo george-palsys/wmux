@@ -82,47 +82,48 @@ describe('StateWriter', () => {
     expect(loaded.sessions[0].id).toBe('good');
   });
 
-  it('saveDebounced does not write immediately', () => {
+  it('saveDebounced does not write immediately', async () => {
     vi.useFakeTimers();
-    try {
-      const state = makeState([makeSession()]);
-      writer.saveDebounced(state);
+    const state = makeState([makeSession()]);
+    writer.saveDebounced(state);
 
-      const filePath = path.join(tmpDir, 'sessions.json');
-      expect(fs.existsSync(filePath)).toBe(false);
+    const filePath = path.join(tmpDir, 'sessions.json');
+    expect(fs.existsSync(filePath)).toBe(false);
 
-      // Advance past debounce interval (30s)
-      vi.advanceTimersByTime(30_000);
+    // Advance past debounce interval (30s). T2: the timer enqueues
+    // an async write on the coalescing queue; fake timers only
+    // advance setTimeout, so we switch to real timers and wait for
+    // the real async file I/O to complete.
+    vi.advanceTimersByTime(30_000);
+    vi.useRealTimers();
+    // Give the event loop a few ticks for fsp.writeFile/rename to run.
+    await new Promise((r) => setTimeout(r, 50));
 
-      expect(fs.existsSync(filePath)).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(fs.existsSync(filePath)).toBe(true);
   });
 
-  it('saveDebounced coalesces multiple calls within debounce window', () => {
+  it('saveDebounced coalesces multiple calls within debounce window', async () => {
     vi.useFakeTimers();
-    try {
-      writer.saveDebounced(makeState([makeSession({ id: 'v1' })]));
+    writer.saveDebounced(makeState([makeSession({ id: 'v1' })]));
 
-      vi.advanceTimersByTime(10_000);
-      writer.saveDebounced(makeState([makeSession({ id: 'v2' })]));
+    vi.advanceTimersByTime(10_000);
+    writer.saveDebounced(makeState([makeSession({ id: 'v2' })]));
 
-      vi.advanceTimersByTime(10_000);
-      writer.saveDebounced(makeState([makeSession({ id: 'v3' })]));
+    vi.advanceTimersByTime(10_000);
+    writer.saveDebounced(makeState([makeSession({ id: 'v3' })]));
 
-      // Timer from first call fires at 30s
-      vi.advanceTimersByTime(10_000);
+    // Timer from first call fires at 30s.
+    vi.advanceTimersByTime(10_000);
+    vi.useRealTimers();
+    // Let the async write settle on the real event loop.
+    await new Promise((r) => setTimeout(r, 50));
 
-      const filePath = path.join(tmpDir, 'sessions.json');
-      expect(fs.existsSync(filePath)).toBe(true);
+    const filePath = path.join(tmpDir, 'sessions.json');
+    expect(fs.existsSync(filePath)).toBe(true);
 
-      const loaded = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      // Should have the latest pending state
-      expect(loaded.sessions[0].id).toBe('v3');
-    } finally {
-      vi.useRealTimers();
-    }
+    const loaded = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    // Should have the latest pending state
+    expect(loaded.sessions[0].id).toBe('v3');
   });
 
   it('flush writes pending state immediately', () => {

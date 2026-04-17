@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { useTerminal } from '../../hooks/useTerminal';
 import { useStore } from '../../stores';
+import { useIpc } from '../../hooks/useIpc';
 import ViCopyMode from './ViCopyMode';
 import SearchBar from './SearchBar';
 import '@xterm/xterm/css/xterm.css';
@@ -31,6 +32,11 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   const setViCopyModeActive = useStore((s) => s.setViCopyModeActive);
   const searchBarVisible = useStore((s) => s.searchBarVisible);
   const setSearchBarVisible = useStore((s) => s.setSearchBarVisible);
+  const { invoke: ipcInvoke } = useIpc();
+  // Keep the invoker stable across re-renders without re-triggering the PTY
+  // creation effect below.
+  const ipcInvokeRef = useRef(ipcInvoke);
+  ipcInvokeRef.current = ipcInvoke;
 
   // Hide restoring overlay when first data arrives
   const handleFirstData = useCallback(() => setRestoring(false), []);
@@ -86,16 +92,20 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
 
     const workspaceId = useStore.getState().activeWorkspaceId;
     console.log(`[Terminal] Creating new PTY: shell=${shell}, cwd=${cwd}, cols=${cols}, rows=${rows}, ws=${workspaceId}`);
-    window.electronAPI.pty.create({ shell, cwd, cols, rows, workspaceId }).then((result: { id: string }) => {
-      if (cancelled) {
-        // 이미 unmount됨 — PTY 정리
-        window.electronAPI.pty.dispose(result.id);
+    void ipcInvokeRef.current<{ id: string }>(() =>
+      window.electronAPI.pty.create({ shell, cwd, cols, rows, workspaceId })
+    ).then((result) => {
+      if (!result.ok) {
+        // Toast surfaced by useIpc (e.g. DAEMON_DISCONNECTED). Nothing to do.
         return;
       }
-      setPtyId(result.id);
-      onPtyCreated?.(result.id);
-    }).catch((err: unknown) => {
-      console.error('Failed to create PTY:', err);
+      if (cancelled) {
+        // 이미 unmount됨 — PTY 정리
+        window.electronAPI.pty.dispose(result.data.id);
+        return;
+      }
+      setPtyId(result.data.id);
+      onPtyCreated?.(result.data.id);
     });
 
     return () => { cancelled = true; };

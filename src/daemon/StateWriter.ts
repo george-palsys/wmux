@@ -3,29 +3,59 @@ import path from 'node:path';
 import type { DaemonState } from './types';
 import {
   atomicReadJSONSync,
+  atomicWriteJSON,
   atomicWriteJSONSync,
 } from './util/atomicWrite';
+import { AsyncQueue } from './util/AsyncQueue';
 
 const DEBOUNCE_MS = 30_000;
+const QUEUE_KEY = 'state';
 
 /**
  * Persists DaemonState (sessions.json) to disk using the shared
  * atomic-write helpers in `./util/atomicWrite`. The public API
  * (saveImmediate / saveDebounced / load / flush / dispose) is frozen
- * so T2 can layer AsyncQueue onto the debounce path without changing
- * call sites.
+ * so later waves can layer behaviour without changing call sites.
+ *
+ * Concurrency model (T2):
+ *   - `saveImmediate` is synchronous and remains so — the daemon's
+ *     emergency-exit paths (SIGINT/SIGTERM/session-end/etc.) rely on
+ *     it running inline. Before writing it clears any queued async
+ *     write so a stale debounced snapshot cannot overwrite the newer
+ *     immediate one.
+ *   - `saveDebounced` funnels through an `AsyncQueue` keyed `'state'`
+ *     so only one async write is ever in flight. Repeated debounced
+ *     calls coalesce to the latest snapshot.
+ *   - `flushSync` drains the queue by invoking the registered sync
+ *     fallback (used by process-exit handlers where the event loop
+ *     has stopped).
  */
 export class StateWriter {
   private filePath: string;
   private debounceTimer: NodeJS.Timeout | null = null;
   private pendingState: DaemonState | null = null;
+  private readonly queue = new AsyncQueue();
 
   constructor(baseDir: string) {
     this.filePath = path.join(baseDir, 'sessions.json');
+
+    // Sync fallback used by `flushSync()` on emergency exit paths.
+    // It writes whatever the latest pending snapshot is using the
+    // synchronous atomic-write helper.
+    this.queue.setSyncFallback(QUEUE_KEY, () => {
+      if (this.pendingState !== null) {
+        atomicWriteJSONSync(this.filePath, this.pendingState);
+        this.pendingState = null;
+      }
+    });
   }
 
   /** Immediately write state to disk (session create/destroy/state change). */
   saveImmediate(state: DaemonState): void {
+    // Drop any queued async write — we are about to persist a newer
+    // snapshot synchronously, and we don't want the older in-flight
+    // payload to overwrite it after we return.
+    this.queue.clear();
     try {
       atomicWriteJSONSync(this.filePath, state);
 
@@ -46,9 +76,29 @@ export class StateWriter {
 
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      if (this.pendingState !== null) {
-        this.saveImmediate(this.pendingState);
-      }
+      const snapshot = this.pendingState;
+      if (snapshot === null) return;
+
+      // Hand the actual I/O off to the coalescing queue so concurrent
+      // debounced writes (or an overlapping immediate save) cannot
+      // race each other over the shared `.bak`/`.tmp` rotation.
+      void this.queue.enqueue(QUEUE_KEY, async () => {
+        // Re-read pendingState at task execution time — another
+        // saveDebounced() call between the timer firing and this
+        // microtask running will have updated it.
+        const payload = this.pendingState;
+        if (payload === null) return;
+        try {
+          await atomicWriteJSON(this.filePath, payload);
+          // Only clear pending if no newer snapshot arrived while we
+          // were writing — otherwise we'd discard the newer data.
+          if (this.pendingState === payload) {
+            this.pendingState = null;
+          }
+        } catch (err) {
+          console.error('[StateWriter] Failed to save state (async):', err);
+        }
+      });
     }, DEBOUNCE_MS);
   }
 
@@ -89,6 +139,33 @@ export class StateWriter {
     if (this.pendingState !== null) {
       this.saveImmediate(this.pendingState);
     }
+  }
+
+  /**
+   * Process-exit friendly drain. Cancels the debounce timer and runs
+   * any registered sync fallbacks for queued async writes. Safe to
+   * call multiple times.
+   */
+  flushSync(): void {
+    if (this.debounceTimer !== null) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    // If we have a pending snapshot that was never enqueued (timer
+    // hadn't fired yet), stage it so the queue's sync fallback can
+    // pick it up uniformly. We enqueue a no-op task keyed `state`
+    // that will be replaced by the fallback on drain.
+    if (this.pendingState !== null && this.queue.isIdle) {
+      // Side-stepping the async path: we invoke the fallback directly
+      // because nothing was enqueued for the queue to drain.
+      try {
+        atomicWriteJSONSync(this.filePath, this.pendingState);
+        this.pendingState = null;
+      } catch (err) {
+        console.error('[StateWriter] flushSync immediate write failed:', err);
+      }
+    }
+    this.queue.flushSync();
   }
 
   /** Clean up timers (daemon shutdown). Flushes pending state first. */

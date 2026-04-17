@@ -31,9 +31,11 @@ import process from 'node:process';
 
 import {
   BACKUP_SUFFIXES,
+  isManagedBackup,
   rotateBackups,
   rotateBackupsSync,
 } from './rotation';
+import { quarantineFile, quarantineFileSync } from './quarantine';
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -170,6 +172,29 @@ async function unlinkIfExists(p: string): Promise<void> {
   }
 }
 
+/**
+ * T6: decide whether `candidatePath` is eligible for quarantine.
+ *
+ * We quarantine:
+ *   - the primary file itself, and
+ *   - any rotation-managed slot (`.bak`, `.bak.1` … `.bak.3`).
+ *
+ * We do NOT quarantine the T7 pre-migration sentinel
+ * (`.v{n}.premigrate.bak`) — it is a one-shot diagnostic artifact and
+ * operators expect it to stick around independent of validation
+ * outcome. The `isManagedBackup` allowlist already rejects it, so we
+ * just reuse that check.
+ */
+function isQuarantineEligible(
+  targetPath: string,
+  candidatePath: string,
+): boolean {
+  if (candidatePath === targetPath) return true;
+  const targetBase = path.basename(targetPath);
+  const candidateBase = path.basename(candidatePath);
+  return isManagedBackup(targetBase, candidateBase);
+}
+
 // ── Async write ──────────────────────────────────────────────────────
 
 export async function atomicWriteJSON(
@@ -289,11 +314,26 @@ export async function atomicReadJSON<T>(
     }
 
     if (opts.validate && !opts.validate(parsed)) {
-      // TODO(T6): route `parsed` + source path to the quarantine
-      // helper instead of dropping it silently. For T1a we match
-      // the historical "return null and warn" behaviour.
-      // eslint-disable-next-line no-console
-      console.warn(`[atomicRead] validate() rejected ${label} "${p}"`);
+      // T6: hand the offending file off to quarantine so the next
+      // write does not silently overwrite it. We still return null
+      // here — the fallback chain below (`.bak` → `.bak.1` → …) is
+      // preserved so a healthy older slot can still rescue the read.
+      //
+      // Eligibility guard: only quarantine the primary file or a
+      // rotation-managed `.bak` slot. The T7 `.premigrate.bak`
+      // sentinel is deliberately left in place (see
+      // `isQuarantineEligible`), though it cannot normally reach
+      // this branch because the fallback iterates only
+      // `BACKUP_SUFFIXES`.
+      if (isQuarantineEligible(targetPath, p)) {
+        try {
+          await quarantineFile(p, 'validate rejected parsed payload', {
+            clock: opts.clock,
+          });
+        } catch {
+          // best-effort — never let quarantine failures mask the read.
+        }
+      }
       return null;
     }
 
@@ -414,9 +454,16 @@ export function atomicReadJSONSync<T>(
     }
 
     if (opts.validate && !opts.validate(parsed)) {
-      // TODO(T6): quarantine instead of warn+null.
-      // eslint-disable-next-line no-console
-      console.warn(`[atomicRead] validate() rejected ${label} "${p}"`);
+      // T6 sync counterpart — see `atomicReadJSON` for the rationale.
+      if (isQuarantineEligible(targetPath, p)) {
+        try {
+          quarantineFileSync(p, 'validate rejected parsed payload', {
+            clock: opts.clock,
+          });
+        } catch {
+          // best-effort
+        }
+      }
       return null;
     }
 
