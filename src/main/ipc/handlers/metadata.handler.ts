@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { IPC } from '../../../shared/constants';
 import { MetadataCollector } from '../../metadata/MetadataCollector';
 import { PTYManager } from '../../pty/PTYManager';
+import { wrapHandler } from '../wrapHandler';
 
 const collector = new MetadataCollector();
 
@@ -18,11 +19,11 @@ export function registerMetadataHandlers(
 ): () => void {
   // Handle metadata request from renderer
   ipcMain.removeHandler(IPC.METADATA_REQUEST);
-  ipcMain.handle(IPC.METADATA_REQUEST, async (_event, ptyId: string) => {
+  ipcMain.handle(IPC.METADATA_REQUEST, wrapHandler(IPC.METADATA_REQUEST, async (_event: Electron.IpcMainInvokeEvent, ptyId: string) => {
     const cwd = cwdMap.get(ptyId);
     const shellBranch = branchMap.get(ptyId);
     return collector.collect(cwd, shellBranch);
-  });
+  }));
 
   // Periodic metadata polling (every 5 seconds)
   const pollingInterval = setInterval(async () => {

@@ -13,11 +13,13 @@ import ApprovalDialog from '../Company/ApprovalDialog';
 import CompanyView from '../Company/CompanyView';
 import MessageFeedPanel from '../Company/MessageFeedPanel';
 import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
+import ToastContainer from '../Toast/ToastContainer';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { useKeyboard } from '../../hooks/useKeyboard';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
+import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, Surface } from '../../../shared/types';
 import { Terminal } from '@xterm/xterm';
 import { terminalRegistry } from '../../hooks/useTerminal';
@@ -174,6 +176,7 @@ export default function AppLayout() {
   useKeyboard();
   useNotificationListener();
   useRpcBridge();
+  const { invoke: ipcInvoke } = useIpc();
 
   // ─── File drop — handled in preload where File.path is accessible ──────
   const [isDragging, setIsDragging] = useState(false);
@@ -235,8 +238,16 @@ export default function AppLayout() {
   // If a saved ptyId exists in the daemon, reconnect to it.
   // Otherwise, clear it so Terminal.tsx creates a fresh PTY.
   const reconcilePtys = useCallback(async () => {
+    const listResult = await ipcInvoke<{ id: string }[]>(() =>
+      window.electronAPI.pty.list()
+    );
+    if (!listResult.ok) {
+      // Toast already shown by useIpc; skip reconciliation silently.
+      console.error('[AppLayout] PTY reconciliation aborted:', listResult.error.code);
+      return;
+    }
     try {
-      const activePtys = await window.electronAPI.pty.list();
+      const activePtys = listResult.data;
       const activeIds = new Set(activePtys.map((p: { id: string }) => p.id));
       console.log('[AppLayout] Daemon active PTYs:', [...activeIds]);
 
@@ -281,7 +292,7 @@ export default function AppLayout() {
     } catch (err) {
       console.error('[AppLayout] PTY reconciliation failed:', err);
     }
-  }, []);
+  }, [ipcInvoke]);
 
   // 앱 시작 시 세션 복원
   useEffect(() => {
@@ -578,6 +589,7 @@ export default function AppLayout() {
           }}
         />
       )}
+      <ToastContainer />
     </div>
     </ErrorBoundary>
   );
