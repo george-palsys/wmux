@@ -4,6 +4,7 @@ import { OscParser } from '../main/pty/OscParser';
 import { AgentDetector } from '../main/pty/AgentDetector';
 import { ActivityMonitor } from '../main/pty/ActivityMonitor';
 import { RingBuffer } from './RingBuffer';
+import { PromptEventLog, parseOsc133Payload } from './PromptEventLog';
 
 /**
  * Daemon version of PTYBridge.
@@ -30,7 +31,12 @@ export class DaemonPTYBridge extends EventEmitter {
   private static readonly ANSI_STRIP = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[[\?]?[0-9;]*[hlm]/g;
   private static readonly PROMPT_CWD = /(?:PS\s+([A-Za-z]:\\[^>]*?)>)|(?:\w+@[\w.-]+:([^\$]+?)\$)/;
 
-  setupDataForwarding(ptyProcess: IPty, ringBuffer: RingBuffer, sessionId: string): void {
+  setupDataForwarding(
+    ptyProcess: IPty,
+    ringBuffer: RingBuffer,
+    sessionId: string,
+    promptLog?: PromptEventLog,
+  ): void {
     const oscParser = new OscParser();
     this.oscParser = oscParser;
 
@@ -48,11 +54,19 @@ export class DaemonPTYBridge extends EventEmitter {
       this.emit('idle', { sessionId: ptyId });
     });
 
-    // OSC events → cwd
+    // OSC events → cwd (OSC 7) and prompt/command markers (OSC 133)
     oscParser.onOsc((event) => {
       if (event.code === 7) {
         const cwd = event.data.replace(/^file:\/\/[^/]*/, '');
         this.emit('cwd', { sessionId, cwd });
+        return;
+      }
+      if (event.code === 133 && promptLog) {
+        const parsed = parseOsc133Payload(event.data, Date.now(), ringBuffer.totalBytesWritten);
+        if (parsed) {
+          promptLog.append(parsed);
+          this.emit('prompt', { sessionId, event: parsed });
+        }
       }
     });
 

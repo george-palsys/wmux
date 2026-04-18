@@ -5,6 +5,8 @@ import os from 'node:os';
 import type { DaemonSession, DaemonSessionState, DaemonConfig } from './types';
 import { RingBuffer } from './RingBuffer';
 import { DaemonPTYBridge } from './DaemonPTYBridge';
+import { PromptEventLog } from './PromptEventLog';
+import { buildSpawnInjection } from './shell-integration';
 
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
@@ -19,6 +21,8 @@ export interface ManagedSession {
   ptyProcess: IPty;
   ringBuffer: RingBuffer;
   bridge: DaemonPTYBridge;
+  /** Structured prompt/command boundaries emitted by OSC 133 shell integration. */
+  promptLog: PromptEventLog;
 }
 
 /**
@@ -120,8 +124,26 @@ export class DaemonSessionManager extends EventEmitter {
       env[key] = value;
     }
 
+    // Shell integration: dot-source our OSC 133 init script when the shell
+    // is a supported family (pwsh/bash). Unknown shells (cmd.exe, zsh, etc.)
+    // get a plain spawn with no args and silently skip integration.
+    let spawnArgs: string[] = [];
+    try {
+      const injection = buildSpawnInjection(cmd);
+      if (injection) {
+        spawnArgs = injection.args;
+        for (const [k, v] of Object.entries(injection.env)) {
+          env[k] = v;
+        }
+      }
+    } catch (err) {
+      // Integration install failure must not break session creation.
+      // eslint-disable-next-line no-console
+      console.warn('[DaemonSessionManager] shell integration unavailable:', err);
+    }
+
     // Spawn ConPTY
-    const ptyProcess = pty.spawn(cmd, [], {
+    const ptyProcess = pty.spawn(cmd, spawnArgs, {
       name: 'xterm-256color',
       cols,
       rows,
@@ -161,8 +183,9 @@ export class DaemonSessionManager extends EventEmitter {
 
     // Bridge: PTY data → RingBuffer + events
     const bridge = new DaemonPTYBridge();
+    const promptLog = new PromptEventLog();
 
-    const managed: ManagedSession = { meta, ptyProcess, ringBuffer, bridge };
+    const managed: ManagedSession = { meta, ptyProcess, ringBuffer, bridge, promptLog };
     this.sessions.set(params.id, managed);
 
     // Forward bridge events to manager-level events
@@ -188,8 +211,9 @@ export class DaemonSessionManager extends EventEmitter {
       this.emit('session:stateChanged', { id: params.id, state: 'dead' as DaemonSessionState });
     });
 
-    // Set up data forwarding (PTY → RingBuffer + events)
-    bridge.setupDataForwarding(ptyProcess, ringBuffer, params.id);
+    // Set up data forwarding (PTY → RingBuffer + events), hooking the
+    // prompt/command log so OSC 133 markers populate a structured journal.
+    bridge.setupDataForwarding(ptyProcess, ringBuffer, params.id, promptLog);
 
     this.emit('session:created', { session: { ...meta } });
     return { ...meta };

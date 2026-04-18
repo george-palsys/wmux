@@ -11,6 +11,7 @@ export class RingBuffer {
   private readonly capacity: number;
   private writePos: number;   // next write position (0..capacity-1)
   private length: number;     // bytes currently stored (<= capacity)
+  private totalWritten: number; // monotonic lifetime count (used as byte offset for PromptEventLog)
 
   constructor(capacityBytes: number) {
     if (capacityBytes <= 0 || !Number.isInteger(capacityBytes)) {
@@ -20,6 +21,7 @@ export class RingBuffer {
     this.buffer = Buffer.alloc(capacityBytes);
     this.writePos = 0;
     this.length = 0;
+    this.totalWritten = 0;
   }
 
   /**
@@ -29,6 +31,8 @@ export class RingBuffer {
   write(data: Buffer): void {
     const dataLen = data.length;
     if (dataLen === 0) return;
+
+    this.totalWritten += dataLen;
 
     // If incoming data is larger than capacity, only keep the tail
     if (dataLen >= this.capacity) {
@@ -53,6 +57,14 @@ export class RingBuffer {
 
     this.writePos = (this.writePos + dataLen) % this.capacity;
     this.length = Math.min(this.length + dataLen, this.capacity);
+  }
+
+  /**
+   * Total bytes ever written to this buffer over its lifetime (monotonic).
+   * Used by PromptEventLog as a stable offset even after the ring wraps.
+   */
+  get totalBytesWritten(): number {
+    return this.totalWritten;
   }
 
   /**
@@ -82,6 +94,9 @@ export class RingBuffer {
     this.buffer.fill(0);
     this.writePos = 0;
     this.length = 0;
+    // totalWritten is intentionally NOT reset — it represents the stream's
+    // lifetime byte count, which PromptEventLog consumers may still hold
+    // references to.
   }
 
   /** Number of bytes currently stored. */
