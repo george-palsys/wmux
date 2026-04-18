@@ -18,7 +18,9 @@ export class PipeServer {
   private static readonly MAX_RETRIES = 5;
   private static readonly MAX_CONNECTIONS = 50;
   private static readonly GLOBAL_RATE_LIMIT = 200;
+  private static readonly MAX_NEW_CONNECTIONS_PER_SEC = 30;
   private globalRate = { count: 0, resetAt: 0 };
+  private connectionRate = { count: 0, resetAt: 0 };
 
   constructor(router: RpcRouter) {
     this.router = router;
@@ -48,6 +50,7 @@ export class PipeServer {
 
   private startInternal(): void {
     this.server = net.createServer((socket) => {
+      if (!this.admitConnection(socket)) return;
       this.connectedSockets.add(socket);
       socket.on('close', () => {
         this.connectedSockets.delete(socket);
@@ -150,6 +153,7 @@ export class PipeServer {
     if (process.platform !== 'win32') return; // Only needed on Windows
 
     this.tcpServer = net.createServer((socket) => {
+      if (!this.admitConnection(socket)) return;
       this.connectedSockets.add(socket);
       socket.on('close', () => {
         this.connectedSockets.delete(socket);
@@ -171,6 +175,25 @@ export class PipeServer {
       fs.writeFileSync(portFile, String(addr.port), { encoding: 'utf8', mode: 0o600 });
       console.log(`[PipeServer] TCP fallback listening on 127.0.0.1:${addr.port}`);
     });
+  }
+
+  /**
+   * Enforce pre-auth connection rate limit.
+   * Returns false (and destroys the socket) when the per-second cap is exceeded,
+   * mitigating brute-force token enumeration over a pipe that cannot be restricted
+   * by DACL from Node.js.
+   */
+  private admitConnection(socket: net.Socket): boolean {
+    const now = Date.now();
+    if (now > this.connectionRate.resetAt) {
+      this.connectionRate = { count: 0, resetAt: now + 1000 };
+    }
+    this.connectionRate.count++;
+    if (this.connectionRate.count > PipeServer.MAX_NEW_CONNECTIONS_PER_SEC) {
+      socket.destroy();
+      return false;
+    }
+    return true;
   }
 
   private handleConnection(socket: net.Socket): void {
@@ -248,6 +271,8 @@ export class PipeServer {
         error: 'unauthorized',
       });
       socket.write(unauthorizedResponse + '\n');
+      // Close the socket so each token guess must pay the per-second connection cap.
+      socket.destroy();
       return;
     }
 

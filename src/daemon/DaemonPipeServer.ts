@@ -22,10 +22,12 @@ export class DaemonPipeServer {
   private readonly connectedSockets = new Set<net.Socket>();
   private readonly rateLimits = new Map<net.Socket, { count: number; resetAt: number }>();
   private globalRate = { count: 0, resetAt: 0 };
+  private connectionRate = { count: 0, resetAt: 0 };
 
   private static readonly MAX_CONNECTIONS = 20;
   private static readonly GLOBAL_RATE_LIMIT = 200;
   private static readonly PER_SOCKET_RATE_LIMIT = 50;
+  private static readonly MAX_NEW_CONNECTIONS_PER_SEC = 20;
 
   private activePipeName: string;
 
@@ -153,6 +155,18 @@ export class DaemonPipeServer {
   private tryListen(name: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const server = net.createServer((socket) => {
+        // Pre-auth connection rate limit: mitigates brute-force on auth token
+        // when the pipe DACL itself cannot be restricted (libuv limitation).
+        const now = Date.now();
+        if (now > this.connectionRate.resetAt) {
+          this.connectionRate = { count: 0, resetAt: now + 1000 };
+        }
+        this.connectionRate.count++;
+        if (this.connectionRate.count > DaemonPipeServer.MAX_NEW_CONNECTIONS_PER_SEC) {
+          socket.destroy();
+          return;
+        }
+
         if (this.connectedSockets.size >= DaemonPipeServer.MAX_CONNECTIONS) {
           socket.destroy();
           return;
@@ -310,6 +324,9 @@ export class DaemonPipeServer {
     if (tokenBuf.length !== authBuf.length || !crypto.timingSafeEqual(tokenBuf, authBuf)) {
       const res = JSON.stringify({ id: request.id, ok: false, error: 'unauthorized' });
       socket.write(res + '\n');
+      // Close the socket so brute-force must pay the per-second connection cap
+      // for every new token attempt instead of spamming a single long-lived socket.
+      socket.destroy();
       return;
     }
 

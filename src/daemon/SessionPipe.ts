@@ -23,6 +23,11 @@ export class SessionPipe {
   private client: net.Socket | null = null;
   private inputCallback: ((data: Buffer) => void) | null = null;
   private flushed = false;
+  private connectionRate = { count: 0, resetAt: 0 };
+
+  // A single session pipe is legitimately consumed by at most one renderer at a time.
+  // Anything above this cap in a 1-second window is brute-force / scanner traffic.
+  private static readonly MAX_NEW_CONNECTIONS_PER_SEC = 10;
 
   constructor(
     private readonly sessionId: string,
@@ -46,6 +51,19 @@ export class SessionPipe {
 
     return new Promise<void>((resolve, reject) => {
       this.server = net.createServer((socket) => {
+        // Pre-auth connection throttle: Named Pipe DACL cannot be restricted from
+        // Node.js (libuv limitation), so brute-force token guessers are rate-capped
+        // at the accept() layer before reaching auth.
+        const now = Date.now();
+        if (now > this.connectionRate.resetAt) {
+          this.connectionRate = { count: 0, resetAt: now + 1000 };
+        }
+        this.connectionRate.count++;
+        if (this.connectionRate.count > SessionPipe.MAX_NEW_CONNECTIONS_PER_SEC) {
+          socket.destroy();
+          return;
+        }
+
         // Only one client at a time
         if (this.client) {
           socket.destroy();

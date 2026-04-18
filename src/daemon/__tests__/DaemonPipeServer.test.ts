@@ -204,6 +204,72 @@ describe('DaemonPipeServer', () => {
     expect(res.ok).toBe(false);
     expect(res.error).toBe('test error');
   });
+
+  it('should close the socket after an auth failure', async () => {
+    // Pre-auth hardening: a rejected token must not leave the connection
+    // open for repeated guesses over the same socket.
+    await server.start();
+
+    const { unauthorized, closed } = await new Promise<{
+      unauthorized: boolean;
+      closed: boolean;
+    }>((resolve, reject) => {
+      let sawUnauthorized = false;
+      const client = net.createConnection(pipeName, () => {
+        client.write(
+          JSON.stringify({ id: 'x', method: 'daemon.ping', params: {}, token: 'wrong' }) + '\n',
+        );
+      });
+      client.setEncoding('utf8');
+      client.on('data', (chunk: string) => {
+        if (chunk.includes('unauthorized')) sawUnauthorized = true;
+      });
+      client.on('close', () => {
+        resolve({ unauthorized: sawUnauthorized, closed: true });
+      });
+      client.on('error', reject);
+      setTimeout(() => reject(new Error('timeout')), 3000);
+    });
+
+    expect(unauthorized).toBe(true);
+    expect(closed).toBe(true);
+  });
+
+  it('should reject new connections past the per-second cap', async () => {
+    // MAX_NEW_CONNECTIONS_PER_SEC is 20. Opening 40 sockets back-to-back
+    // should result in at least some being destroyed on accept.
+    await server.start();
+
+    const sockets: net.Socket[] = [];
+    const closeCounts = { closed: 0, total: 40 };
+
+    await new Promise<void>((resolve) => {
+      let pending = closeCounts.total;
+      for (let i = 0; i < closeCounts.total; i++) {
+        const s = net.createConnection(pipeName);
+        sockets.push(s);
+        const markDone = () => {
+          pending--;
+          if (pending === 0) resolve();
+        };
+        s.on('close', () => {
+          closeCounts.closed++;
+          markDone();
+        });
+        s.on('error', () => {
+          markDone();
+        });
+      }
+      // Safety — resolve after 2s even if sockets linger
+      setTimeout(resolve, 2000);
+    });
+
+    for (const s of sockets) s.destroy();
+
+    // At least a handful of the excess connections must have been refused.
+    // (We don't assert the exact number because accept() timing varies.)
+    expect(closeCounts.closed).toBeGreaterThanOrEqual(closeCounts.total / 2);
+  });
 });
 
 // ============================================================
