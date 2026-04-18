@@ -30,9 +30,15 @@ export class DaemonPipeServer {
   private static readonly MAX_NEW_CONNECTIONS_PER_SEC = 20;
 
   private activePipeName: string;
+  private tokenPathOverride: string | null = null;
 
   constructor(private readonly pipeName: string) {
     this.activePipeName = pipeName;
+  }
+
+  /** For testing: redirect the on-disk token file to a temp path. */
+  setTokenPathForTest(tokenPath: string): void {
+    this.tokenPathOverride = tokenPath;
   }
 
   /** Get the actual pipe name being used (may differ from requested if fallback occurred). */
@@ -247,6 +253,23 @@ export class DaemonPipeServer {
     this.authToken = token;
   }
 
+  /**
+   * Rotate the daemon auth token. Drops all currently connected clients and
+   * rewrites the token file. Used to respond to suspected token leakage —
+   * any attacker holding the old token is immediately locked out.
+   */
+  rotateToken(): string {
+    const newToken = crypto.randomUUID();
+    secureWriteTokenFile(this.getTokenPath(), newToken);
+    this.authToken = newToken;
+    for (const socket of this.connectedSockets) {
+      socket.destroy();
+    }
+    this.connectedSockets.clear();
+    this.rateLimits.clear();
+    return newToken;
+  }
+
   /** Broadcast an event to all connected clients as a newline-delimited JSON message. */
   broadcast(event: unknown): void {
     const msg = JSON.stringify(event) + '\n';
@@ -262,6 +285,7 @@ export class DaemonPipeServer {
   }
 
   private getTokenPath(): string {
+    if (this.tokenPathOverride) return this.tokenPathOverride;
     const home = os.homedir();
     return path.join(home, '.wmux', 'daemon-auth-token');
   }

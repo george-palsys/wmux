@@ -2,6 +2,7 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { getPipeName, getAuthTokenPath, getTcpPortPath } from '../../shared/constants';
+import { secureWriteTokenFile } from '../../shared/security';
 import type { RpcRequest } from '../../shared/rpc';
 import { RpcRouter } from './RpcRouter';
 
@@ -12,7 +13,7 @@ export class PipeServer {
   private tcpServer: net.Server | null = null;
   private readonly router: RpcRouter;
   private readonly connectedSockets = new Set<net.Socket>();
-  private readonly authToken: string;
+  private authToken: string;
   private readonly rateLimits = new Map<net.Socket, { count: number; resetAt: number }>();
   private retryCount = 0;
   private static readonly MAX_RETRIES = 5;
@@ -34,11 +35,38 @@ export class PipeServer {
       const existing = fs.readFileSync(getAuthTokenPath(), 'utf8').trim();
       if (existing) return existing;
     } catch { /* file doesn't exist yet */ }
-    return crypto.randomUUID();
+    // Persist the freshly generated token immediately so MCP clients and other
+    // processes don't see an empty token file during the window between server
+    // init and McpRegistrar.register() — previously a race that forced clients
+    // onto an env-var fallback if they raced the registrar.
+    const token = crypto.randomUUID();
+    try {
+      secureWriteTokenFile(getAuthTokenPath(), token);
+    } catch (err) {
+      console.warn('[PipeServer] Failed to persist auth token at init:', err);
+    }
+    return token;
   }
 
   getAuthToken(): string {
     return this.authToken;
+  }
+
+  /**
+   * Rotate the auth token. Drops all connected clients (they must reconnect
+   * with the new token) and rewrites the on-disk token file atomically via
+   * secureWriteTokenFile. Used to respond to suspected token leakage.
+   */
+  rotateToken(): string {
+    const newToken = crypto.randomUUID();
+    secureWriteTokenFile(getAuthTokenPath(), newToken);
+    this.authToken = newToken;
+    for (const socket of this.connectedSockets) {
+      socket.destroy();
+    }
+    this.connectedSockets.clear();
+    this.rateLimits.clear();
+    return newToken;
   }
 
   start(): void {

@@ -235,6 +235,51 @@ describe('DaemonPipeServer', () => {
     expect(closed).toBe(true);
   });
 
+  it('rotateToken invalidates old token, issues new one, drops connected sockets', async () => {
+    // Redirect token file to a temp location so we don't clobber the user's
+    // real ~/.wmux/daemon-auth-token during the test.
+    const tmpTokenPath = path.join(os.tmpdir(), `wmux-test-token-${crypto.randomUUID().slice(0, 8)}`);
+    server.setTokenPathForTest(tmpTokenPath);
+
+    server.onRpc('daemon.ping', async () => ({ pong: true }));
+    await server.start();
+
+    // Open a long-lived connection using the current token.
+    const liveClient = net.createConnection(pipeName);
+    const liveClosed = new Promise<void>((resolve) => liveClient.on('close', () => resolve()));
+
+    // Wait briefly for connection to be registered.
+    await new Promise<void>((resolve) => {
+      liveClient.on('connect', () => setTimeout(resolve, 50));
+    });
+
+    const oldToken = 'test-token-123';
+    const newToken = server.rotateToken();
+
+    expect(newToken).not.toBe(oldToken);
+    expect(newToken.length).toBeGreaterThan(0);
+    expect(fs.readFileSync(tmpTokenPath, 'utf8').trim()).toBe(newToken);
+
+    // Existing socket should be dropped by rotation.
+    await liveClosed;
+
+    // Old token is now rejected, new token succeeds.
+    const rejected = await sendRpc(pipeName, {
+      id: 'r1', method: 'daemon.ping', params: {}, token: oldToken,
+    });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.error).toBe('unauthorized');
+
+    const accepted = await sendRpc(pipeName, {
+      id: 'r2', method: 'daemon.ping', params: {}, token: newToken,
+    });
+    expect(accepted.ok).toBe(true);
+    expect(accepted.result).toEqual({ pong: true });
+
+    // Cleanup tmp token file.
+    try { fs.unlinkSync(tmpTokenPath); } catch { /* ignore */ }
+  });
+
   it('should reject new connections past the per-second cap', async () => {
     // MAX_NEW_CONNECTIONS_PER_SEC is 20. Opening 40 sockets back-to-back
     // should result in at least some being destroyed on accept.
