@@ -418,6 +418,110 @@ server.tool(
   },
 );
 
+// === Company A2A tools ===
+// These expose the company-mode member-level A2A (inbox/ack pattern) on the
+// main MCP server so agents don't need a second MCP connection. The legacy
+// wmux-company standalone server still exists for lightweight launches but
+// ships the same `company_a2a_*` tool names, so both surfaces are
+// interchangeable. Only useful when a wmux "company" has been provisioned
+// on the active workspace — otherwise the underlying RPCs return an empty
+// / unavailable response.
+
+server.tool(
+  'company_a2a_whoami',
+  'Company mode: identify who you are in the company hierarchy (name, role, department, status). Requires an active company on the workspace — use a2a_whoami for plain workspace identity instead.',
+  {},
+  async () => {
+    const wsId = await requireWorkspaceId();
+    return callRpc('company.a2a.whoami', { workspaceId: wsId });
+  },
+);
+
+server.tool(
+  'company_a2a_send',
+  'Company mode: send a structured message to another agent by name (resolves by department → lead, member name, or "CEO"). Prefer this over send_message when the target is a company member rather than a raw workspace.',
+  {
+    to: z.string().describe('Target agent name, department name, or "CEO"'),
+    message: z.string().describe('Message content'),
+    from: z.string().optional().describe('Sender name (auto-detected if omitted)'),
+    priority: z.enum(['low', 'normal', 'high']).optional().describe('Message priority (default: normal)'),
+  },
+  async ({ to, message, from, priority }) => {
+    const wsId = await requireWorkspaceId();
+    let senderName = from;
+    if (!senderName) {
+      try {
+        const whoami = await sendRpc('company.a2a.whoami', { workspaceId: wsId }) as { name?: string } | null;
+        senderName = whoami?.name;
+      } catch { /* use fallback */ }
+    }
+    return callRpc('company.a2a.send', {
+      from: senderName || 'Agent',
+      to,
+      message,
+      priority: priority || 'normal',
+      workspaceId: wsId,
+    });
+  },
+);
+
+server.tool(
+  'company_a2a_broadcast',
+  'Company mode: broadcast a message to ALL agents in the company. Use sparingly. For workspace-wide broadcast (not company members), use a2a_broadcast.',
+  {
+    message: z.string().describe('Broadcast message content'),
+    from: z.string().optional().describe('Sender name (auto-detected if omitted)'),
+    priority: z.enum(['low', 'normal', 'high']).optional().describe('Message priority'),
+  },
+  async ({ message, from, priority }) => {
+    const wsId = await requireWorkspaceId();
+    let senderName = from;
+    if (!senderName) {
+      try {
+        const whoami = await sendRpc('company.a2a.whoami', { workspaceId: wsId }) as { name?: string } | null;
+        senderName = whoami?.name;
+      } catch { /* use fallback */ }
+    }
+    return callRpc('company.a2a.broadcast', {
+      from: senderName || 'Agent',
+      message,
+      priority: priority || 'normal',
+      workspaceId: wsId,
+    });
+  },
+);
+
+server.tool(
+  'company_a2a_inbox',
+  'Company mode: pull your inbox of structured messages from other agents. Returns messages with IDs — call company_a2a_ack to mark them as read. Canonical delivery channel (inbox/ack) rather than PTY paste.',
+  {
+    unread_only: z.boolean().optional().describe('Only return unread messages (default: true)'),
+  },
+  async ({ unread_only }) => {
+    const wsId = await requireWorkspaceId();
+    return callRpc('company.a2a.inbox', { workspaceId: wsId, unreadOnly: unread_only !== false });
+  },
+);
+
+server.tool(
+  'company_a2a_ack',
+  'Company mode: acknowledge (mark as read) inbox messages by their IDs.',
+  {
+    message_ids: z.array(z.string()).describe('Array of message IDs to acknowledge'),
+  },
+  async ({ message_ids }) => {
+    const wsId = await requireWorkspaceId();
+    return callRpc('company.a2a.ack', { workspaceId: wsId, messageIds: message_ids });
+  },
+);
+
+server.tool(
+  'company_a2a_status',
+  'Company mode: get the full company status — all departments, members, roles, and online status. Use this to discover who you can communicate with.',
+  {},
+  async () => callRpc('company.a2a.status'),
+);
+
 // === Start server ===
 
 async function main(): Promise<void> {

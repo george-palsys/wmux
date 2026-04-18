@@ -1,17 +1,22 @@
 #!/usr/bin/env node
 /**
- * wmux-a2a — Agent-to-Agent MCP Server
+ * wmux-company — Company-mode Agent-to-Agent MCP Server
  *
  * Provides structured inter-agent communication for wmux Company Mode.
  * Agents use MCP tool calls instead of text pattern matching.
  *
- * Tools:
- *   a2a_whoami    — Identify this agent (workspace → member)
- *   a2a_send      — Send a message to another agent by name
- *   a2a_broadcast — Broadcast to all agents
- *   a2a_inbox     — Read incoming messages (poll)
- *   a2a_ack       — Acknowledge (mark read) inbox messages
- *   a2a_status    — Get company-wide agent status
+ * Tools (all prefixed with `company_a2a_` to avoid collision with the
+ * workspace-level A2A tools hosted by the main wmux MCP server):
+ *   company_a2a_whoami    — Identify this agent (workspace → member)
+ *   company_a2a_send      — Send a message to another agent by name
+ *   company_a2a_broadcast — Broadcast to all agents
+ *   company_a2a_inbox     — Read incoming messages (poll)
+ *   company_a2a_ack       — Acknowledge (mark read) inbox messages
+ *   company_a2a_status    — Get company-wide agent status
+ *
+ * The main wmux MCP server re-exposes the same `company_a2a_*` tool names,
+ * so agents connected to either server get identical behaviour. Standalone
+ * launch of this server remains supported as a lightweight alternative.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -36,7 +41,7 @@ let MY_WORKSPACE_ID = process.env.WMUX_WORKSPACE_ID || '';
 let workspaceResolved = !!MY_WORKSPACE_ID;
 
 const server = new McpServer({
-  name: 'wmux-a2a',
+  name: 'wmux-company',
   version: getVersion(),
 });
 
@@ -111,10 +116,10 @@ async function requireWorkspaceId(): Promise<string> {
   return wsId;
 }
 
-// ── a2a_whoami ──────────────────────────────────────────────────────────────
+// ── company_a2a_whoami ──────────────────────────────────────────────────────
 
 server.tool(
-  'a2a_whoami',
+  'company_a2a_whoami',
   'Identify who you are in the company hierarchy. Returns your name, role, department, and status.',
   {},
   async () => {
@@ -123,10 +128,10 @@ server.tool(
   },
 );
 
-// ── a2a_send ────────────────────────────────────────────────────────────────
+// ── company_a2a_send ────────────────────────────────────────────────────────
 
 server.tool(
-  'a2a_send',
+  'company_a2a_send',
   'Send a structured message to another agent by name. ' +
   'Resolves target by: department name → lead, exact member name, or "CEO". ' +
   'Returns delivery status (delivered/queued).',
@@ -155,10 +160,10 @@ server.tool(
   },
 );
 
-// ── a2a_broadcast ───────────────────────────────────────────────────────────
+// ── company_a2a_broadcast ───────────────────────────────────────────────────
 
 server.tool(
-  'a2a_broadcast',
+  'company_a2a_broadcast',
   'Broadcast a message to ALL agents in the company. Use sparingly.',
   {
     message: z.string().describe('Broadcast message content'),
@@ -183,12 +188,13 @@ server.tool(
   },
 );
 
-// ── a2a_inbox ───────────────────────────────────────────────────────────────
+// ── company_a2a_inbox ───────────────────────────────────────────────────────
 
 server.tool(
-  'a2a_inbox',
+  'company_a2a_inbox',
   'Check your inbox for incoming messages from other agents. ' +
-  'Returns messages with IDs — use a2a_ack to mark them as read.',
+  'Returns messages with IDs — use company_a2a_ack to mark them as read. ' +
+  'This is the canonical A2A delivery channel (inbox/ack pattern) rather than PTY paste.',
   {
     unread_only: z.boolean().optional().describe('Only return unread messages (default: true)'),
   },
@@ -199,10 +205,10 @@ server.tool(
     }),
 );
 
-// ── a2a_ack ─────────────────────────────────────────────────────────────────
+// ── company_a2a_ack ─────────────────────────────────────────────────────────
 
 server.tool(
-  'a2a_ack',
+  'company_a2a_ack',
   'Acknowledge (mark as read) inbox messages by their IDs.',
   {
     message_ids: z.array(z.string()).describe('Array of message IDs to acknowledge'),
@@ -216,10 +222,10 @@ server.tool(
   },
 );
 
-// ── a2a_status ──────────────────────────────────────────────────────────────
+// ── company_a2a_status ──────────────────────────────────────────────────────
 
 server.tool(
-  'a2a_status',
+  'company_a2a_status',
   'Get the current company status: all departments, members, their roles, and online status. ' +
   'Use this to discover who you can communicate with.',
   {},
