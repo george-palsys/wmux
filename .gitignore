@@ -102,3 +102,6 @@ Thumbs.db
 # Windows debug symbols
 *.pdb
 .claude/worktrees/
+
+# Private roadmap / strategy docs (not for public repo)
+docs/EDITIONS.md
