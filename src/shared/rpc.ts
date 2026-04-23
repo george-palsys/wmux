@@ -29,6 +29,7 @@ export type RpcMethod =
   | 'input.sendKey'
   | 'input.readScreen'
   | 'terminal.readEvents'
+  | 'mcp.claimWorkspace'
   | 'notify'
   | 'meta.setStatus'
   | 'meta.setProgress'
@@ -113,6 +114,7 @@ export const ALL_RPC_METHODS = [
   'input.sendKey',
   'input.readScreen',
   'terminal.readEvents',
+  'mcp.claimWorkspace',
   'notify',
   'meta.setStatus',
   'meta.setProgress',

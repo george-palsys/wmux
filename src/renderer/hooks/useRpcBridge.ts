@@ -158,6 +158,58 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     return ws ? { id: ws.id, name: ws.name } : null;
   }
 
+  if (method === 'mcp.claimWorkspace') {
+    // Spawn a dedicated workspace + PTY for an external MCP caller without
+    // stealing the user's focus. addWorkspace flips activeWorkspaceId to the
+    // new workspace as a side effect, so we snapshot the prior active id and
+    // restore it after PTY creation completes.
+    const previousActiveId = store.activeWorkspaceId;
+    const name = typeof params.name === 'string' && params.name.length > 0
+      ? params.name
+      : undefined;
+
+    store.addWorkspace(name);
+
+    const afterAdd = useStore.getState();
+    const newWs = afterAdd.workspaces.find((w) => w.id === afterAdd.activeWorkspaceId);
+    if (!newWs) {
+      // Should never happen — addWorkspace just set activeWorkspaceId.
+      return { error: 'mcp.claimWorkspace: workspace creation failed' };
+    }
+
+    const newWsId = newWs.id;
+    const paneId = newWs.activePaneId;
+
+    let ptyId: string;
+    try {
+      const created = await window.electronAPI.pty.create({ workspaceId: newWsId });
+      ptyId = created.id;
+    } catch (err) {
+      // Roll back: remove the empty workspace so we don't leave orphans.
+      const rollback = useStore.getState();
+      rollback.removeWorkspace(newWsId);
+      rollback.setActiveWorkspace(previousActiveId);
+      return { error: `mcp.claimWorkspace: PTY create failed — ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    // Re-read state: pane may have been removed during the async gap.
+    const afterPty = useStore.getState();
+    const freshWs = afterPty.workspaces.find((w) => w.id === newWsId);
+    if (!freshWs || !findPaneById(freshWs.rootPane, paneId)) {
+      try { await window.electronAPI.pty.dispose(ptyId); } catch { /* best-effort */ }
+      afterPty.removeWorkspace(newWsId);
+      afterPty.setActiveWorkspace(previousActiveId);
+      return { error: 'mcp.claimWorkspace: pane disappeared during PTY creation' };
+    }
+    afterPty.addSurface(paneId, ptyId, '', '');
+
+    // Restore focus to whatever the user was looking at before — claim must
+    // never steal the active view.
+    useStore.getState().setActiveWorkspace(previousActiveId);
+
+    return { ptyId, workspaceId: newWsId, workspaceName: newWs.name };
+  }
+
   // -------------------------------------------------------------------------
   // surface.*
   // -------------------------------------------------------------------------

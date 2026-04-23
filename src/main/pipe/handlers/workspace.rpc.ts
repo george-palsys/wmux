@@ -49,4 +49,24 @@ export function registerWorkspaceRpc(router: RpcRouter, getWindow: GetWindow): v
   router.register('workspace.current', (_params) =>
     sendToRenderer(getWindow, 'workspace.current'),
   );
+
+  /**
+   * mcp.claimWorkspace — spawn a dedicated workspace + PTY for an external
+   * MCP caller (i.e. Claude Code running in a terminal outside wmux).
+   *
+   * Without this, terminal_send falls through to the currently-focused pane
+   * and injects keystrokes into the user's live work. claim creates an
+   * isolated workspace, spawns a terminal in it, and returns the ptyId so
+   * the MCP client can pin all future "no-ptyId" calls to that PTY.
+   *
+   * Critically, the renderer restores the previous active workspace after
+   * creation — claim must not steal the user's focus.
+   *
+   * params: { name?: string }
+   * returns: { ptyId, workspaceId, workspaceName }
+   */
+  router.register('mcp.claimWorkspace', (params) => {
+    const name = typeof params['name'] === 'string' ? params['name'] : undefined;
+    return sendToRenderer(getWindow, 'mcp.claimWorkspace', name !== undefined ? { name } : {});
+  });
 }

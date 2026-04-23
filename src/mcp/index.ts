@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { sendRpc } from './wmux-client';
 import type { RpcMethod } from '../shared/rpc';
+import { resolveDefaultPtyId as resolveDefaultPtyIdImpl } from './paneResolver';
 import { PlaywrightEngine } from './playwright/PlaywrightEngine';
 import { registerNavigationTools } from './playwright/tools/navigation';
 import { registerInteractionTools } from './playwright/tools/interaction';
@@ -122,6 +123,12 @@ async function requireWorkspaceId(): Promise<string> {
   return wsId;
 }
 
+// External-caller pane pinning — see src/mcp/paneResolver.ts for rationale.
+// Bind the resolver's deps to this module's sendRpc + resolveWorkspaceId.
+function resolveDefaultPtyId(): Promise<string | null> {
+  return resolveDefaultPtyIdImpl({ sendRpc, resolveWorkspaceId });
+}
+
 // === Browser tools (RPC-based: surface management stays in main process) ===
 
 server.tool(
@@ -201,7 +208,8 @@ server.tool(
   },
   async ({ ptyId, tail_lines }) => {
     const params: Record<string, unknown> = {};
-    if (ptyId) params.ptyId = ptyId;
+    const effective = ptyId ?? (await resolveDefaultPtyId()) ?? undefined;
+    if (effective) params.ptyId = effective;
     if (tail_lines !== undefined) params.tail_lines = tail_lines;
     return callRpc('input.readScreen', params);
   },
@@ -218,7 +226,8 @@ server.tool(
   },
   async ({ ptyId, limit, sinceOffset, lastCommandOnly }) => {
     const params: Record<string, unknown> = {};
-    if (ptyId) params.ptyId = ptyId;
+    const effective = ptyId ?? (await resolveDefaultPtyId()) ?? undefined;
+    if (effective) params.ptyId = effective;
     if (limit !== undefined) params.limit = limit;
     if (sinceOffset !== undefined) params.sinceOffset = sinceOffset;
     if (lastCommandOnly) params.lastCommandOnly = true;
@@ -233,7 +242,10 @@ server.tool(
     text: z.string().describe('Text to send to the terminal'),
     ptyId: z.string().optional().describe('Target a specific terminal by PTY ID. Omit to use the active terminal. Get PTY IDs from surface_list().'),
   },
-  async ({ text, ptyId }) => callRpc('input.send', ptyId ? { text, ptyId } : { text }),
+  async ({ text, ptyId }) => {
+    const effective = ptyId ?? (await resolveDefaultPtyId()) ?? undefined;
+    return callRpc('input.send', effective ? { text, ptyId: effective } : { text });
+  },
 );
 
 server.tool(
@@ -245,7 +257,10 @@ server.tool(
     ),
     ptyId: z.string().optional().describe('Target a specific terminal by PTY ID. Omit to use the active terminal. Get PTY IDs from surface_list().'),
   },
-  async ({ key, ptyId }) => callRpc('input.sendKey', ptyId ? { key, ptyId } : { key }),
+  async ({ key, ptyId }) => {
+    const effective = ptyId ?? (await resolveDefaultPtyId()) ?? undefined;
+    return callRpc('input.sendKey', effective ? { key, ptyId: effective } : { key });
+  },
 );
 
 // === Workspace tools ===
