@@ -171,8 +171,10 @@ export async function writeSoulToFile(presetId: string, workDir: string): Promis
   if (!hasSoul(presetId)) return false;
   const raw = await loadSoul(presetId);
   if (!raw) return false;
+  const fs = window.electronAPI.fs;
+  if (!fs) return false;
   const filePath = `${workDir}/.claude/CLAUDE.md`;
-  return window.electronAPI.fs.writeFile(filePath, raw);
+  return fs.writeFile(filePath, raw);
 }
 
 /**
