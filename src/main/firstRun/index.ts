@@ -62,7 +62,16 @@ export function registerFirstRunHandlers(orchestrator: FirstRunOrchestrator): ()
         // FIRST_RUN_SAMPLE_TASK_READY / TIMEOUT event channels rather than
         // the invoke return value, so the renderer can keep the wizard
         // responsive while the 5s OSC133 handshake plays out.
-        void orchestrator.startSampleTask(payload.ptyId);
+        //
+        // I6 fix: if startSampleTask itself throws (e.g. PTYBridge gone,
+        // daemon disconnect mid-flight), the wizard would otherwise hang in
+        // 'awaiting-prompt' forever because it relies on the READY/TIMEOUT
+        // event channels for resolution. Surface failures as a TIMEOUT
+        // event so the wizard's fallback "Press Enter" UI engages.
+        orchestrator.startSampleTask(payload.ptyId).catch((err: unknown) => {
+          console.error('[firstRun] startSampleTask failed:', err);
+          orchestrator.emitSampleTaskTimeout();
+        });
       },
     ),
   );

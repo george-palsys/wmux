@@ -173,6 +173,14 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
+  // ─── Mount guard (I3) ──────────────────────────────────────────────────
+  // The ptyId-wait subscription inside handleTrySampleTask schedules state
+  // updates after async work (10s timeout + store subscription). Without a
+  // guard, dismissing the wizard mid-handshake would call setState on an
+  // unmounted component AND leak the store subscription / pending timer.
+  const isMountedRef = useRef(true);
+  useEffect(() => () => { isMountedRef.current = false; }, []);
+
   // ─── Initial check ─────────────────────────────────────────────────────────
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -247,6 +255,13 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
   }, [refresh]);
 
   // ─── Sample task ───────────────────────────────────────────────────────────
+  // TODO(I1): the 2x2 grid created by applyLayoutTemplate('builtin-grid')
+  // is not rolled back if the user dismisses (Skip / Escape / ×) while we
+  // are still in 'splitting' or 'awaiting-prompt'. The store currently has
+  // no public set-rootPane / restore-layout primitive (we only mutate
+  // ws.rootPane through paneSlice's split/close and uiSlice's
+  // applyLayoutTemplate). Adding a new store action is out of scope for
+  // this fix-up; revisit alongside paneSlice undo/redo work.
   const handleTrySampleTask = useCallback(async () => {
     if (sampleState !== 'idle') return;
     setSampleState('splitting');
@@ -267,6 +282,9 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
     // 3. Wait for the top-left leaf's first surface to acquire a non-empty ptyId.
     //    The Terminal component creates the pty asynchronously when it mounts;
     //    we subscribe to the store and resolve as soon as ptyId is populated.
+    //    I3 guard: if the wizard unmounts mid-wait (Skip / Escape / × click)
+    //    we tear down the subscription + timer immediately and resolve null
+    //    so no setState lands on the unmounted component.
     const ptyId = await new Promise<string | null>((resolve) => {
       const tryGet = (): string | null => {
         const s = useStore.getState();
@@ -286,6 +304,12 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
       }
 
       const unsub = useStore.subscribe(() => {
+        if (!isMountedRef.current) {
+          unsub();
+          clearTimeout(timer);
+          resolve(null);
+          return;
+        }
         const got = tryGet();
         if (got) {
           unsub();
@@ -298,6 +322,8 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
         resolve(null);
       }, PTYID_WAIT_TIMEOUT_MS);
     });
+
+    if (!isMountedRef.current) return;
 
     if (!ptyId) {
       setSampleState('error');
@@ -318,6 +344,7 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
     const bridge = firstRunBridge();
     unsubReady = bridge.onSampleTaskReady(() => {
       cleanup();
+      if (!isMountedRef.current) return;
       setSampleState('success');
       // Auto-complete + close after a brief moment so the user can read the success copy.
       setTimeout(() => {
@@ -328,6 +355,7 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
 
     unsubTimeout = bridge.onSampleTaskTimeout(() => {
       cleanup();
+      if (!isMountedRef.current) return;
       setSampleState('timeout-fallback');
     });
 
@@ -336,6 +364,7 @@ export default function FirstRunWizard({ mode, onClose }: FirstRunWizardProps) {
       await bridge.startSampleTask({ ptyId });
     } catch {
       cleanup();
+      if (!isMountedRef.current) return;
       setSampleState('error');
     }
   }, [sampleState]);

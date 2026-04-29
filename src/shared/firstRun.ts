@@ -56,6 +56,16 @@ export interface SampleTaskStartPayload {
 // === Constants ===
 
 /**
+ * DOM CustomEvent name dispatched from the Settings panel "Open setup wizard"
+ * button so AppLayout can re-mount the wizard in mode='reopen' (D4 / D9).
+ *
+ * Hoisted to a shared constant (I2) so the magic string lives in exactly one
+ * place — both the dispatcher (SettingsPanel) and the listener (AppLayout)
+ * import this symbol.
+ */
+export const FIRST_RUN_REOPEN_EVENT = 'wmux:firstrun-reopen';
+
+/**
  * Deterministic command sent to Claude after OSC133 prompt-ready (D3).
  * Verbatim — do not alter without coordinating with SampleTaskRunner / wizard copy.
  */

@@ -6,6 +6,7 @@ import { useIpc } from '../../hooks/useIpc';
 import { THEME_OPTIONS, builtinToCustom, DEFAULT_CUSTOM_THEME, type BuiltinThemeId, type ThemeId } from '../../themes';
 import type { CustomThemeColors } from '../../../shared/types';
 import type { FirstRunCheckResult } from '../../../shared/firstRun';
+import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1395,7 +1396,7 @@ function TabShortcuts() {
 //
 // Surfaces the first-run wizard status (Claude detected? wmux MCP registered?
 // last-completed timestamp) plus two action buttons:
-//   - "Open setup wizard"  → dispatches `wmux:firstrun-reopen` window event
+//   - "Open setup wizard"  → dispatches FIRST_RUN_REOPEN_EVENT window event
 //                            (T8a's AppLayout listens and re-mounts the wizard
 //                            in mode='reopen').
 //   - "Show keyboard cheat sheet" → flips `cheatSheetDismissed` to false in
@@ -1575,7 +1576,7 @@ function TabFirstRunSetup() {
   const handleOpenWizard = useCallback(() => {
     // Cross-component contract with T8a: AppLayout listens for this event and
     // mounts <FirstRunWizard mode='reopen' />. Zero-payload CustomEvent.
-    window.dispatchEvent(new CustomEvent('wmux:firstrun-reopen'));
+    window.dispatchEvent(new CustomEvent(FIRST_RUN_REOPEN_EVENT));
   }, []);
 
   const handleShowCheatSheet = useCallback(() => {

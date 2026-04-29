@@ -25,6 +25,7 @@ import { useRpcBridge } from '../../hooks/useRpcBridge';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, Surface } from '../../../shared/types';
+import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { Terminal } from '@xterm/xterm';
 import { terminalRegistry } from '../../hooks/useTerminal';
 import { withDefaultShell } from '../../utils/ptyCreateOptions';
@@ -183,14 +184,15 @@ export default function AppLayout() {
 
   // ─── First-run wizard + cheat sheet (T8a) ───────────────────────────────
   // Local visibility state for the wizard (null = hidden, otherwise mode).
-  // The cheat sheet has its own permanent-dismissal flag in uiSlice; we use
-  // local state to gate post-wizard reveal so the sheet only appears as part
-  // of the magical-moment flow (not on every session restore).
+  // The cheat sheet visibility is derived from uiSlice: it mounts whenever
+  // the first run is completed AND the user has not permanently dismissed it.
+  // Flipping `cheatSheetDismissed` back to false from Settings (T8b) is what
+  // re-mounts the cheat sheet — observing the slice directly here removes the
+  // earlier local-state gate that left the Settings button dead (C1 fix).
   const firstRunCompleted = useStore((s) => s.firstRunCompleted);
   const cheatSheetDismissed = useStore((s) => s.cheatSheetDismissed);
   const setFirstRunCompleted = useStore((s) => s.setFirstRunCompleted);
   const [showFirstRunWizard, setShowFirstRunWizard] = useState<'firstRun' | 'reopen' | null>(null);
-  const [showCheatSheet, setShowCheatSheet] = useState(false);
 
   const [showAutoUpdatePrompt, setShowAutoUpdatePrompt] = useState(false);
   const t = useT();
@@ -352,7 +354,7 @@ export default function AppLayout() {
   //   - firstRun.check called once on mount
   //   - shown=false flips showFirstRunWizard to 'firstRun'
   //   - shown=true triggers setFirstRunCompleted(true)
-  //   - 'wmux:firstrun-reopen' event flips mode to 'reopen'
+  //   - FIRST_RUN_REOPEN_EVENT flips mode to 'reopen'
   useEffect(() => {
     let cancelled = false;
     const api = window.electronAPI.firstRun;
@@ -375,13 +377,13 @@ export default function AppLayout() {
   }, [setFirstRunCompleted]);
 
   // ─── First-run wizard: reopen contract for SettingsPanel (T8b) ───────
-  // T8b's "Open setup wizard" button dispatches `wmux:firstrun-reopen` on
+  // T8b's "Open setup wizard" button dispatches FIRST_RUN_REOPEN_EVENT on
   // window. No payload. AppLayout listens here and switches the wizard into
   // mode='reopen' (D9: sample task disabled).
   useEffect(() => {
     const handler = () => setShowFirstRunWizard('reopen');
-    window.addEventListener('wmux:firstrun-reopen', handler);
-    return () => window.removeEventListener('wmux:firstrun-reopen', handler);
+    window.addEventListener(FIRST_RUN_REOPEN_EVENT, handler);
+    return () => window.removeEventListener(FIRST_RUN_REOPEN_EVENT, handler);
   }, []);
 
   // ─── First-run onboarding (spotlight) detection ─────────────────────
@@ -477,13 +479,13 @@ export default function AppLayout() {
   }, [activeWorkspace?.id]);
 
   // Wizard close handler (T8a). Mirrors firstRunCompleted into uiSlice (main
-  // already wrote the marker via firstRun:complete or :dismiss) and reveals
-  // the cheat sheet unless the user previously opted out (D11).
+  // already wrote the marker via firstRun:complete or :dismiss). The cheat
+  // sheet auto-mounts via the derived condition below as soon as
+  // firstRunCompleted flips true (D11) — no separate reveal flag needed.
   const handleWizardClose = useCallback(() => {
     setShowFirstRunWizard(null);
     setFirstRunCompleted(true);
-    if (!cheatSheetDismissed) setShowCheatSheet(true);
-  }, [cheatSheetDismissed, setFirstRunCompleted]);
+  }, [setFirstRunCompleted]);
 
   if (!activeWorkspace) return null;
 
@@ -654,17 +656,17 @@ export default function AppLayout() {
 
       {/* First-run wizard (T8a). Sits at z-[70] (declared inside the
           component) so it stacks above the auto-update prompt. T8b's
-          SettingsPanel triggers a `wmux:firstrun-reopen` window event to
+          SettingsPanel triggers a FIRST_RUN_REOPEN_EVENT window event to
           set mode='reopen' (D9). */}
       {showFirstRunWizard !== null && (
         <FirstRunWizard mode={showFirstRunWizard} onClose={handleWizardClose} />
       )}
 
-      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounts after the wizard
-          completes or is dismissed. The component renders null when
-          cheatSheetDismissed=true (D11), so this gate just controls the
-          post-wizard reveal. */}
-      {showCheatSheet && <KeyboardCheatSheet />}
+      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounts derivatively from
+          firstRunCompleted + !cheatSheetDismissed so that flipping
+          cheatSheetDismissed=false from Settings (T8b) immediately re-mounts
+          the sheet. The component itself is a no-op when dismissed (D11). */}
+      {firstRunCompleted && !cheatSheetDismissed && <KeyboardCheatSheet />}
 
       {companyViewVisible && (
         <CompanyView onClose={() => setCompanyViewVisible(false)} />

@@ -8,15 +8,32 @@ import type { FirstRunStatus, SampleTaskOutcome } from '../../../shared/firstRun
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
-vi.mock('node:fs/promises', () => ({
+vi.mock('node:fs/promises', () => {
+  const access = vi.fn();
+  const stat = vi.fn();
+  const readFile = vi.fn();
+  const writeFile = vi.fn();
+  return {
+    default: {
+      access,
+      stat,
+      readFile,
+      writeFile,
+      constants: { W_OK: 2, R_OK: 4 },
+    },
+    access,
+    stat,
+    readFile,
+    writeFile,
+    constants: { W_OK: 2, R_OK: 4 },
+  };
+});
+
+vi.mock('node:os', () => ({
   default: {
-    stat: vi.fn(),
-    readFile: vi.fn(),
-    writeFile: vi.fn(),
+    homedir: () => (process.platform === 'win32' ? 'C:\\Users\\test' : '/home/test'),
   },
-  stat: vi.fn(),
-  readFile: vi.fn(),
-  writeFile: vi.fn(),
+  homedir: () => (process.platform === 'win32' ? 'C:\\Users\\test' : '/home/test'),
 }));
 
 vi.mock('electron', () => ({
@@ -143,6 +160,7 @@ describe('FirstRunOrchestrator', () => {
     vi.mocked(fs.stat).mockReset();
     vi.mocked(fs.readFile).mockReset();
     vi.mocked(fs.writeFile).mockReset();
+    vi.mocked(fs.access).mockReset();
     mockDetect.mockReset();
     mockDetect.mockResolvedValue(STATUS);
     runnerOutcomes.length = 0;
@@ -270,6 +288,11 @@ describe('FirstRunOrchestrator', () => {
 
   // ── 6. registerMcp() — success ──────────────────────────────────────────────
   it('registerMcp() returns ok:true on successful registration', async () => {
+    // Pre-flight: home dir stats fine, claude.json exists + parses + writable.
+    vi.mocked(fs.stat).mockResolvedValue({ isDirectory: () => true } as never);
+    vi.mocked(fs.readFile).mockResolvedValue('{}' as never);
+    vi.mocked(fs.access).mockResolvedValue(undefined as never);
+
     const reg = makeMcpRegistrar({ registered: true });
     const orch = new FirstRunOrchestrator(
       makePtyManager() as never,
@@ -285,12 +308,44 @@ describe('FirstRunOrchestrator', () => {
     expect(reg.register).toHaveBeenCalledWith('auth-token-xyz');
   });
 
-  // ── 7. registerMcp() — EACCES → PERM ────────────────────────────────────────
-  it('registerMcp() maps EACCES to {ok:false, code:PERM}', async () => {
-    const err = Object.assign(new Error('permission denied'), { code: 'EACCES' });
-    const reg = makeMcpRegistrar({
-      registerImpl: () => { throw err; },
-    });
+  // ── 6b. registerMcp() — fresh install (ENOENT on read) still succeeds ──────
+  it('registerMcp() succeeds when ~/.claude.json is missing (ENOENT) but parent dir is writable', async () => {
+    vi.mocked(fs.stat).mockResolvedValue({ isDirectory: () => true } as never);
+    // readFile fails ENOENT — pre-flight should fall through to write probe.
+    vi.mocked(fs.readFile).mockRejectedValue(
+      Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
+    );
+    // access on file fails ENOENT, but on parent dir succeeds.
+    vi.mocked(fs.access).mockImplementation((async (p: string) => {
+      if (typeof p === 'string' && p.endsWith('.claude.json')) {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      }
+      return undefined;
+    }) as never);
+
+    const reg = makeMcpRegistrar({ registered: true });
+    const orch = new FirstRunOrchestrator(
+      makePtyManager() as never,
+      makePtyBridge() as never,
+      () => null,
+      reg as never,
+      () => 'token',
+      () => makeWindow() as never,
+    );
+
+    const result = await orch.registerMcp();
+    expect(result).toEqual({ ok: true });
+    expect(reg.register).toHaveBeenCalledWith('token');
+  });
+
+  // ── 7. registerMcp() — EACCES on read → PERM ───────────────────────────────
+  it('registerMcp() maps EACCES on read to {ok:false, code:PERM}', async () => {
+    vi.mocked(fs.stat).mockResolvedValue({ isDirectory: () => true } as never);
+    vi.mocked(fs.readFile).mockRejectedValue(
+      Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+    );
+
+    const reg = makeMcpRegistrar({ registered: true });
     const orch = new FirstRunOrchestrator(
       makePtyManager() as never,
       makePtyBridge() as never,
@@ -306,14 +361,43 @@ describe('FirstRunOrchestrator', () => {
       expect(result.code).toBe('PERM');
       expect(result.message).toBe('permission denied');
     }
+    // Pre-flight must short-circuit before delegating to McpRegistrar.
+    expect(reg.register).not.toHaveBeenCalled();
   });
 
-  // ── 8. registerMcp() — SyntaxError → PARSE ──────────────────────────────────
-  it('registerMcp() maps SyntaxError to {ok:false, code:PARSE}', async () => {
-    const err = new SyntaxError('Unexpected token in JSON');
-    const reg = makeMcpRegistrar({
-      registerImpl: () => { throw err; },
-    });
+  // ── 7b. registerMcp() — EACCES on write → PERM ─────────────────────────────
+  it('registerMcp() maps EACCES on write probe to {ok:false, code:PERM}', async () => {
+    vi.mocked(fs.stat).mockResolvedValue({ isDirectory: () => true } as never);
+    vi.mocked(fs.readFile).mockResolvedValue('{}' as never);
+    // Both file and parent dir reject with EACCES.
+    vi.mocked(fs.access).mockRejectedValue(
+      Object.assign(new Error('write blocked'), { code: 'EACCES' }),
+    );
+
+    const reg = makeMcpRegistrar({ registered: true });
+    const orch = new FirstRunOrchestrator(
+      makePtyManager() as never,
+      makePtyBridge() as never,
+      () => null,
+      reg as never,
+      () => 'token',
+      () => makeWindow() as never,
+    );
+
+    const result = await orch.registerMcp();
+    expect(result.ok).toBe(false);
+    if (result.ok === false) {
+      expect(result.code).toBe('PERM');
+    }
+    expect(reg.register).not.toHaveBeenCalled();
+  });
+
+  // ── 8. registerMcp() — malformed JSON → PARSE ──────────────────────────────
+  it('registerMcp() maps malformed ~/.claude.json to {ok:false, code:PARSE}', async () => {
+    vi.mocked(fs.stat).mockResolvedValue({ isDirectory: () => true } as never);
+    vi.mocked(fs.readFile).mockResolvedValue('not-valid-json{' as never);
+
+    const reg = makeMcpRegistrar({ registered: true });
     const orch = new FirstRunOrchestrator(
       makePtyManager() as never,
       makePtyBridge() as never,
@@ -327,8 +411,10 @@ describe('FirstRunOrchestrator', () => {
     expect(result.ok).toBe(false);
     if (result.ok === false) {
       expect(result.code).toBe('PARSE');
-      expect(result.message).toContain('Unexpected token');
+      // Native JSON.parse error message contains "Unexpected" or "JSON".
+      expect(result.message.length).toBeGreaterThan(0);
     }
+    expect(reg.register).not.toHaveBeenCalled();
   });
 
   // ── 9. startSampleTask — daemon mode + READY event ──────────────────────────
