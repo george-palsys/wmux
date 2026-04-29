@@ -1,5 +1,10 @@
 import type { ElectronAPI } from '../preload/index';
 import type { TokenEvent } from '../main/pty/TokenTracker';
+import type {
+  FirstRunCheckResult,
+  RegisterMcpResult,
+  SampleTaskStartPayload,
+} from './firstRun';
 
 declare global {
   interface Window {
@@ -38,6 +43,16 @@ declare global {
           configExists: boolean;
           configModified: string | null;
         }>;
+      };
+      firstRun?: {
+        check: () => Promise<FirstRunCheckResult>;
+        complete: () => Promise<void>;
+        dismiss: () => Promise<void>;
+        reopen: () => Promise<FirstRunCheckResult>;
+        registerMcp: () => Promise<RegisterMcpResult>;
+        startSampleTask: (payload: SampleTaskStartPayload) => Promise<void>;
+        onSampleTaskReady: (callback: () => void) => () => void;
+        onSampleTaskTimeout: (callback: () => void) => () => void;
       };
     };
     clipboardAPI: {
