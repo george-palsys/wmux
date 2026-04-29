@@ -81,13 +81,12 @@ jobs:
 
       # Strict lint on files added/modified by the cross-platform port. Any
       # new error here is a real regression introduced by porting work.
+      # NOTE: keep this on ONE line. PowerShell on windows-latest does not
+      # honor bash `\` line continuations, which made eslint receive zero
+      # arguments and walk up the directory tree until it found a stray
+      # .eslintrc.json inside the actions/checkout install dir.
       - name: ESLint (new cross-platform code, strict)
-        run: |
-          npx eslint --max-warnings=0 \
-            src/shared/platform.ts \
-            src/shared/__tests__/platform.test.ts \
-            src/main/pty/__tests__/ShellDetector.test.ts \
-            src/main/notification/__tests__/ToastManager.test.ts
+        run: npx eslint --max-warnings=0 src/shared/platform.ts src/shared/__tests__/platform.test.ts src/main/pty/__tests__/ShellDetector.test.ts src/main/notification/__tests__/ToastManager.test.ts
 
       - name: Vitest (cross-platform)
         run: npx vitest run
