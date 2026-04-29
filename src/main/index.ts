@@ -30,6 +30,8 @@ import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
 import { DaemonClient, getDaemonPipeName, readDaemonAuthToken } from './DaemonClient';
 import { ensureDaemon } from './daemon/launcher';
 import { createTray, destroyTray } from './tray';
+import { FirstRunOrchestrator } from './firstRun/FirstRunOrchestrator';
+import { registerFirstRunHandlers } from './firstRun';
 import { ProcessMonitor } from '../daemon/ProcessMonitor';
 
 // Force English for Chromium internal messages to avoid encoding corruption
@@ -179,6 +181,25 @@ const mcpHandlerOptions = {
 };
 
 let cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, mcpHandlerOptions);
+
+// First-run wizard orchestrator (Plan 1.15) — registered once and survives
+// crash-recovery handler-reload because it owns its own marker + IPC channels
+// distinct from the renderer-facing pty/mcp surfaces.
+const firstRunOrchestrator = new FirstRunOrchestrator(
+  ptyManager,
+  ptyBridge,
+  () => daemonClient,
+  mcpRegistrar,
+  () => {
+    try {
+      return pipeServer.getAuthToken();
+    } catch {
+      return null;
+    }
+  },
+  () => mainWindow,
+);
+const disposeFirstRunHandlers = registerFirstRunHandlers(firstRunOrchestrator);
 
 // Module-scope crash tracking so activate-created windows share the same counters
 let lastCrashTime = 0;
@@ -418,6 +439,7 @@ app.on('before-quit', async (e) => {
   }
 
   cleanupHandlers();
+  disposeFirstRunHandlers();
 
   if (daemonClient?.isConnected) {
     // Daemon mode: detach only — sessions persist in daemon
