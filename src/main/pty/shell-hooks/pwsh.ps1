@@ -18,6 +18,13 @@ if (Test-Path Function:\prompt) {
 }
 
 function prompt {
+    $body = if (Test-Path Function:\__wmux_original_prompt) {
+        __wmux_original_prompt
+    } else {
+        "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+    }
+
+    $oscPrefix = ''
     if (-not $script:__wmux_skip_osc) {
         try {
             # --- OSC 7: Current Working Directory ---
@@ -25,14 +32,14 @@ function prompt {
             $hostname = $env:COMPUTERNAME
             # file:// URI with forward slashes
             $uri = 'file://' + $hostname + '/' + ($cwd -replace '\\', '/')
-            [Console]::Write("`e]7;$uri`a")
+            $oscPrefix += "`e]7;$uri`a"
 
             # --- OSC 7727: Git branch (best-effort) ---
             $gitExe = Get-Command git -ErrorAction SilentlyContinue
             if ($gitExe) {
                 $branch = & git rev-parse --abbrev-ref HEAD 2>$null
                 if ($LASTEXITCODE -eq 0 -and $branch) {
-                    [Console]::Write("`e]7727;$branch`a")
+                    $oscPrefix += "`e]7727;$branch`a"
                 }
             }
         } catch {
@@ -43,9 +50,5 @@ function prompt {
         }
     }
 
-    # Call original prompt to preserve user theme / starship / oh-my-posh etc.
-    if (Test-Path Function:\__wmux_original_prompt) {
-        return __wmux_original_prompt
-    }
-    return "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+    return $oscPrefix + [string]$body
 }
