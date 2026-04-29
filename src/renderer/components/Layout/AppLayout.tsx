@@ -25,6 +25,7 @@ import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, Surface } from '../../../shared/types';
 import { Terminal } from '@xterm/xterm';
 import { terminalRegistry } from '../../hooks/useTerminal';
+import { withDefaultShell } from '../../utils/ptyCreateOptions';
 
 /** Map shell executable path to a human-readable display name. */
 function shellDisplayName(shellPath: string): string {
@@ -275,7 +276,9 @@ export default function AppLayout() {
             } else {
               console.log(`[AppLayout] Surface ${surface.id}: ptyId ${surface.ptyId} not in daemon, creating new PTY`);
               try {
-                const newPty = await window.electronAPI.pty.create({ cwd: surface.cwd, workspaceId: wsId });
+                const newPty = await window.electronAPI.pty.create(
+                  withDefaultShell({ cwd: surface.cwd, workspaceId: wsId }, useStore.getState().defaultShell)
+                );
                 useStore.getState().updateSurfacePtyId(pane.id, surface.id, newPty.id);
               } catch (err) {
                 console.error(`[AppLayout] Failed to create replacement PTY:`, err);
@@ -389,7 +392,9 @@ export default function AppLayout() {
 
     for (const leaf of emptyLeaves) {
       const paneId = leaf.id;
-      window.electronAPI.pty.create({ workspaceId: wsId }).then((result: { id: string; shell?: string; cwd?: string }) => {
+      window.electronAPI.pty.create(
+        withDefaultShell({ workspaceId: wsId }, useStore.getState().defaultShell)
+      ).then((result: { id: string; shell?: string; cwd?: string }) => {
         if (cancelled) {
           window.electronAPI.pty.dispose(result.id);
           return;

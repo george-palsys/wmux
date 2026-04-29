@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { useTerminal, type ContextMenuEvent } from '../../hooks/useTerminal';
 import { useStore } from '../../stores';
 import { useIpc } from '../../hooks/useIpc';
+import { withDefaultShell } from '../../utils/ptyCreateOptions';
 import ViCopyMode from './ViCopyMode';
 import SearchBar from './SearchBar';
 import BookmarkIndicator from './BookmarkIndicator';
@@ -98,9 +99,10 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
     }
 
     const workspaceId = useStore.getState().activeWorkspaceId;
+    const defaultShell = useStore.getState().defaultShell;
     console.log(`[Terminal] Creating new PTY: shell=${shell}, cwd=${cwd}, cols=${cols}, rows=${rows}, ws=${workspaceId}`);
     void ipcInvokeRef.current<{ id: string }>(() =>
-      window.electronAPI.pty.create({ shell, cwd, cols, rows, workspaceId })
+      window.electronAPI.pty.create(withDefaultShell({ shell, cwd, cols, rows, workspaceId }, defaultShell))
     ).then((result) => {
       if (!result.ok) {
         // Toast surfaced by useIpc (e.g. DAEMON_DISCONNECTED). Nothing to do.

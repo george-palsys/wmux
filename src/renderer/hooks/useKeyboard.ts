@@ -3,6 +3,7 @@ import { useStore } from '../stores';
 import { findLeaf } from '../../shared/paneUtils';
 import { terminalRegistry } from './useTerminal';
 import { t } from '../i18n';
+import { withDefaultShell } from '../utils/ptyCreateOptions';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -278,7 +279,7 @@ export function useKeyboard() {
         const state = store.getState();
         const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
         if (ws) {
-          window.electronAPI.pty.create({ workspaceId: ws.id }).then((result: { id: string }) => {
+          window.electronAPI.pty.create(withDefaultShell({ workspaceId: ws.id }, state.defaultShell)).then((result: { id: string }) => {
             store.getState().addSurface(ws.activePaneId, result.id, 'Terminal', '');
           });
         }

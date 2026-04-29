@@ -2,11 +2,13 @@ import { useRef, useEffect, useCallback } from 'react';
 import { useTerminal } from '../../hooks/useTerminal';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
+import { withDefaultShell } from '../../utils/ptyCreateOptions';
 import '@xterm/xterm/css/xterm.css';
 
 export default function FloatingPane() {
   const floatingPaneVisible = useStore((s) => s.floatingPaneVisible);
   const floatingPanePtyId = useStore((s) => s.floatingPanePtyId);
+  const defaultShell = useStore((s) => s.defaultShell);
   const toggleFloatingPane = useStore((s) => s.toggleFloatingPane);
   const setFloatingPanePtyId = useStore((s) => s.setFloatingPanePtyId);
   const t = useT();
@@ -21,13 +23,13 @@ export default function FloatingPane() {
     if (creatingRef.current) return;
 
     creatingRef.current = true;
-    window.electronAPI.pty.create({}).then((result: { id: string }) => {
+    window.electronAPI.pty.create(withDefaultShell({}, defaultShell)).then((result: { id: string }) => {
       setFloatingPanePtyId(result.id);
       creatingRef.current = false;
     }).catch(() => {
       creatingRef.current = false;
     });
-  }, [floatingPaneVisible, floatingPanePtyId, setFloatingPanePtyId]);
+  }, [defaultShell, floatingPaneVisible, floatingPanePtyId, setFloatingPanePtyId]);
 
   useTerminal(containerRef, {
     ptyId: floatingPanePtyId,

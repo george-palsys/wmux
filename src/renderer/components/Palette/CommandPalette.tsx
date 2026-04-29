@@ -3,6 +3,7 @@ import { useStore } from '../../stores';
 import PaletteItem, { type PaletteItemData, type PaletteCategory } from './PaletteItem';
 import { useT } from '../../hooks/useT';
 import { useIpc } from '../../hooks/useIpc';
+import { withDefaultShell } from '../../utils/ptyCreateOptions';
 
 // ---------------------------------------------------------------------------
 // SVG Icons (inline, no external dependency)
@@ -209,7 +210,7 @@ export default function CommandPalette() {
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
           if (ws) {
             void ipcInvoke<{ id: string }>(() =>
-              window.electronAPI.pty.create({ workspaceId: ws.id })
+              window.electronAPI.pty.create(withDefaultShell({ workspaceId: ws.id }, state.defaultShell))
             ).then((result) => {
               if (result.ok) {
                 useStore.getState().addSurface(ws.activePaneId, result.data.id, 'Terminal', '');

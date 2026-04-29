@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useStore } from '../stores';
+import { withDefaultShell } from '../utils/ptyCreateOptions';
 import type { Pane, PaneLeaf, Surface } from '../../shared/types';
 import { validateMessage } from '../../shared/types';
 import type { Message, Part, TaskState, Artifact, AgentSkill } from '../../shared/types';
@@ -183,7 +184,9 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
 
     let ptyId: string;
     try {
-      const created = await window.electronAPI.pty.create({ workspaceId: newWsId });
+      const created = await window.electronAPI.pty.create(
+        withDefaultShell({ workspaceId: newWsId }, useStore.getState().defaultShell)
+      );
       ptyId = created.id;
     } catch (err) {
       // Roll back: remove the empty workspace so we don't leave orphans.
@@ -253,7 +256,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     const cwd = typeof params.cwd === 'string' ? params.cwd : '';
 
     const { id: ptyId } = await window.electronAPI.pty.create({
-      shell: shell || undefined,
+      ...withDefaultShell({ shell: shell || undefined }, store.defaultShell),
       cwd: cwd || undefined,
       workspaceId: ws.id,
     });

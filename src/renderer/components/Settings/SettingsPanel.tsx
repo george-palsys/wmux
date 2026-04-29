@@ -9,6 +9,7 @@ import type { CustomThemeColors } from '../../../shared/types';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type TabId = 'general' | 'appearance' | 'notifications' | 'shortcuts' | 'about';
+type ShellInfo = { name: string; path: string; args?: string[] };
 
 // ─── Icon components ──────────────────────────────────────────────────────────
 
@@ -181,12 +182,28 @@ function KbdRow({ keys, description }: { keys: string; description: string }) {
 
 // ─── Static config (product names — no translation needed) ───────────────────
 
-const SHELL_OPTIONS = [
-  { value: 'powershell', label: 'PowerShell' },
-  { value: 'cmd',        label: 'Command Prompt' },
-  { value: 'gitbash',   label: 'Git Bash' },
-  { value: 'wsl',        label: 'WSL' },
-];
+function resolveDefaultShellPath(current: string, shells: ShellInfo[]): string {
+  const existing = shells.find((shell) => shell.path === current);
+  if (existing) return existing.path;
+
+  const lower = current.toLowerCase();
+  const basename = (shell: ShellInfo) => shell.path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() || '';
+
+  if (lower === 'powershell') {
+    return shells.find((shell) => basename(shell) === 'powershell.exe')?.path || shells[0].path;
+  }
+  if (lower === 'cmd') {
+    return shells.find((shell) => basename(shell) === 'cmd.exe')?.path || shells[0].path;
+  }
+  if (lower === 'gitbash') {
+    return shells.find((shell) => shell.name === 'Git Bash')?.path || shells[0].path;
+  }
+  if (lower === 'wsl') {
+    return shells.find((shell) => basename(shell) === 'wsl.exe')?.path || shells[0].path;
+  }
+
+  return shells[0].path;
+}
 
 const FONT_FAMILY_OPTIONS = [
   { value: 'Cascadia Code',    label: 'Cascadia Code' },
@@ -600,11 +617,30 @@ function TabGeneral() {
   const scrollbackLines = useStore((s) => s.scrollbackLines);
   const setScrollbackLines = useStore((s) => s.setScrollbackLines);
   const autoUpdateEnabled = useStore((s) => s.autoUpdateEnabled);
+  const [detectedShells, setDetectedShells] = useState<ShellInfo[]>([]);
   const storeSetAutoUpdate = useStore((s) => s.setAutoUpdateEnabled);
   const setAutoUpdateEnabled = (enabled: boolean) => {
     storeSetAutoUpdate(enabled);
     window.electronAPI.settings.setAutoUpdateEnabled(enabled);
   };
+  const shellOptions = detectedShells.map((shell) => ({ value: shell.path, label: shell.name }));
+
+  useEffect(() => {
+    let cancelled = false;
+    window.electronAPI.shell.list()
+      .then((shells) => {
+        if (cancelled) return;
+        setDetectedShells(shells);
+        const shellPaths = new Set(shells.map((shell) => shell.path));
+        if (shells.length > 0 && !shellPaths.has(useStore.getState().defaultShell)) {
+          setDefaultShell(resolveDefaultShellPath(useStore.getState().defaultShell, shells));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setDetectedShells([]);
+      });
+    return () => { cancelled = true; };
+  }, [setDefaultShell]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -638,7 +674,7 @@ function TabGeneral() {
             label={t('settings.defaultShell')}
             value={defaultShell}
             onChange={setDefaultShell}
-            options={SHELL_OPTIONS}
+            options={shellOptions}
           />
         </SettingRow>
         <SettingRow label={t('settings.scrollbackLines')} description={t('settings.scrollbackDesc')}>
