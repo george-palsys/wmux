@@ -5,10 +5,11 @@ import { useT } from '../../hooks/useT';
 import { useIpc } from '../../hooks/useIpc';
 import { THEME_OPTIONS, builtinToCustom, DEFAULT_CUSTOM_THEME, type BuiltinThemeId, type ThemeId } from '../../themes';
 import type { CustomThemeColors } from '../../../shared/types';
+import type { FirstRunCheckResult } from '../../../shared/firstRun';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'general' | 'appearance' | 'notifications' | 'shortcuts' | 'about';
+type TabId = 'general' | 'appearance' | 'notifications' | 'shortcuts' | 'first-run-setup' | 'about';
 type ShellInfo = { name: string; path: string; args?: string[] };
 
 // ─── Icon components ──────────────────────────────────────────────────────────
@@ -1390,6 +1391,208 @@ function TabShortcuts() {
   );
 }
 
+// ─── First-run setup tab (T8b) ────────────────────────────────────────────────
+//
+// Surfaces the first-run wizard status (Claude detected? wmux MCP registered?
+// last-completed timestamp) plus two action buttons:
+//   - "Open setup wizard"  → dispatches `wmux:firstrun-reopen` window event
+//                            (T8a's AppLayout listens and re-mounts the wizard
+//                            in mode='reopen').
+//   - "Show keyboard cheat sheet" → flips `cheatSheetDismissed` to false in
+//                            uiSlice; T8a's effect remounts the cheat sheet.
+//
+// Section name is "First-run setup" (D7-C4 — avoids collision with the
+// existing "Onboarding" spotlight tutorial).
+//
+// Pure helpers are exported for unit tests (mirrors FirstRunWizard pattern —
+// vitest runs in a `node` env without a DOM library, so we test via
+// renderToStaticMarkup + pure helpers).
+
+/** Format an ISO timestamp as YYYY-MM-DD. Returns '' for undefined / invalid. */
+export function formatFirstRunDate(iso: string | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/** Locally-narrowed view of the firstRun preload bridge (matches T1 freeze). */
+interface FirstRunBridge {
+  check: () => Promise<FirstRunCheckResult>;
+}
+
+function firstRunBridgeOrNull(): FirstRunBridge | null {
+  const api = (window as unknown as {
+    electronAPI?: { firstRun?: FirstRunBridge };
+  }).electronAPI;
+  return api?.firstRun ?? null;
+}
+
+interface FirstRunStatusViewProps {
+  status: FirstRunCheckResult | null;
+  onOpenWizard: () => void;
+  onShowCheatSheet: () => void;
+}
+
+/**
+ * Pure presentational block exported for renderToStaticMarkup tests.
+ *
+ * Renders the four status rows + the two action buttons. State + event wiring
+ * lives in {@link TabFirstRunSetup}; this component just receives the data.
+ */
+export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: FirstRunStatusViewProps) {
+  const t = useT();
+
+  const lastCompleted = status?.completedAt
+    ? t('settings.firstRunSetup.lastCompleted', { date: formatFirstRunDate(status.completedAt) })
+    : t('settings.firstRunSetup.notCompleted');
+
+  const claudeFound = !!status?.status.claudeFound;
+  const mcpRegistered = !!status?.status.mcpRegistered;
+
+  const claudeStatusText = t('settings.firstRunSetup.claudeStatus', {
+    status: claudeFound
+      ? t('settings.firstRunSetup.statusDetected')
+      : t('settings.firstRunSetup.statusNotDetected'),
+  });
+  const mcpStatusText = t('settings.firstRunSetup.mcpStatus', {
+    status: mcpRegistered
+      ? t('settings.firstRunSetup.statusRegistered')
+      : t('settings.firstRunSetup.statusNotRegistered'),
+  });
+
+  return (
+    <div className="flex flex-col gap-4" data-testid="first-run-setup-section">
+      {/* Status */}
+      <div className="flex flex-col gap-2">
+        <SectionLabel label={t('settings.firstRunSetup')} />
+
+        <div
+          className="px-3 py-2.5 rounded-lg"
+          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+          data-testid="first-run-setup-last-completed"
+        >
+          <p className="text-sm text-[color:var(--text-main)]">{lastCompleted}</p>
+          <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">
+            {t('settings.firstRunSetupDesc')}
+          </p>
+        </div>
+
+        <div
+          className="px-3 py-2 rounded-lg flex items-center gap-2"
+          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+          data-testid="first-run-setup-claude-row"
+        >
+          <span
+            className="text-[10px] font-mono w-3 text-center"
+            style={{ color: claudeFound ? 'var(--accent-green, #a6e3a1)' : 'var(--accent-red, #f38ba8)' }}
+          >
+            {claudeFound ? '✓' : '✗'}
+          </span>
+          <span className="text-sm text-[color:var(--text-main)] font-mono">{claudeStatusText}</span>
+        </div>
+
+        <div
+          className="px-3 py-2 rounded-lg flex items-center gap-2"
+          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+          data-testid="first-run-setup-mcp-row"
+        >
+          <span
+            className="text-[10px] font-mono w-3 text-center"
+            style={{ color: mcpRegistered ? 'var(--accent-green, #a6e3a1)' : 'var(--accent-red, #f38ba8)' }}
+          >
+            {mcpRegistered ? '✓' : '✗'}
+          </span>
+          <span className="text-sm text-[color:var(--text-main)] font-mono">{mcpStatusText}</span>
+        </div>
+
+        {status?.status.claudeJsonPath && (
+          <p
+            className="text-[10px] text-[color:var(--text-muted)] mt-0.5 font-mono truncate px-3"
+            title={status.status.claudeJsonPath}
+            data-testid="first-run-setup-claude-path"
+          >
+            {status.status.claudeJsonPath}
+          </p>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onOpenWizard}
+          className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            color: 'var(--accent-blue)',
+            border: '1px solid var(--bg-overlay)',
+          }}
+          data-testid="first-run-setup-open-wizard"
+        >
+          {t('settings.firstRunSetup.openWizard')}
+        </button>
+        <button
+          onClick={onShowCheatSheet}
+          className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            color: 'var(--text-main)',
+            border: '1px solid var(--bg-overlay)',
+          }}
+          data-testid="first-run-setup-show-cheat-sheet"
+        >
+          {t('settings.firstRunSetup.showCheatSheet')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TabFirstRunSetup() {
+  const [status, setStatus] = useState<FirstRunCheckResult | null>(null);
+  const setCheatSheetDismissed = useStore((s) => s.setCheatSheetDismissed);
+
+  useEffect(() => {
+    const api = firstRunBridgeOrNull();
+    if (!api) return;
+    let cancelled = false;
+    api.check()
+      .then((result) => {
+        if (!cancelled) setStatus(result);
+      })
+      .catch(() => {
+        // Silent — dev shells without preload should render the empty state.
+        if (!cancelled) setStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleOpenWizard = useCallback(() => {
+    // Cross-component contract with T8a: AppLayout listens for this event and
+    // mounts <FirstRunWizard mode='reopen' />. Zero-payload CustomEvent.
+    window.dispatchEvent(new CustomEvent('wmux:firstrun-reopen'));
+  }, []);
+
+  const handleShowCheatSheet = useCallback(() => {
+    // Approach A (per task brief): flip uiSlice flag back to false. T8a's
+    // AppLayout effect on cheatSheetDismissed → false re-mounts the cheat sheet.
+    setCheatSheetDismissed(false);
+  }, [setCheatSheetDismissed]);
+
+  return (
+    <FirstRunStatusView
+      status={status}
+      onOpenWizard={handleOpenWizard}
+      onShowCheatSheet={handleShowCheatSheet}
+    />
+  );
+}
+
 function TabAbout() {
   const t = useT();
 
@@ -1462,11 +1665,12 @@ export default function SettingsPanel() {
   const panelRef = useRef<HTMLDivElement>(null);
 
   const tabs: { id: TabId; label: string; icon: string }[] = [
-    { id: 'general',       label: t('settings.tabGeneral'),       icon: '⚙' },
-    { id: 'appearance',    label: t('settings.tabAppearance'),    icon: '◑' },
-    { id: 'notifications', label: t('settings.tabNotifications'), icon: '◎' },
-    { id: 'shortcuts',     label: t('settings.tabShortcuts'),     icon: '⌨' },
-    { id: 'about',         label: t('settings.tabAbout'),         icon: 'ℹ' },
+    { id: 'general',         label: t('settings.tabGeneral'),       icon: '⚙' },
+    { id: 'appearance',      label: t('settings.tabAppearance'),    icon: '◑' },
+    { id: 'notifications',   label: t('settings.tabNotifications'), icon: '◎' },
+    { id: 'shortcuts',       label: t('settings.tabShortcuts'),     icon: '⌨' },
+    { id: 'first-run-setup', label: t('settings.firstRunSetup'),    icon: '◇' },
+    { id: 'about',           label: t('settings.tabAbout'),         icon: 'ℹ' },
   ];
 
   // Close on Escape
@@ -1556,11 +1760,12 @@ export default function SettingsPanel() {
 
           {/* Right content */}
           <div className="flex-1 overflow-y-auto px-5 py-4">
-            {activeTab === 'general' && <TabGeneral />}
-            {activeTab === 'appearance'    && <TabAppearance />}
-            {activeTab === 'notifications' && <TabNotifications />}
-            {activeTab === 'shortcuts'     && <TabShortcuts />}
-            {activeTab === 'about'         && <TabAbout />}
+            {activeTab === 'general'         && <TabGeneral />}
+            {activeTab === 'appearance'      && <TabAppearance />}
+            {activeTab === 'notifications'   && <TabNotifications />}
+            {activeTab === 'shortcuts'       && <TabShortcuts />}
+            {activeTab === 'first-run-setup' && <TabFirstRunSetup />}
+            {activeTab === 'about'           && <TabAbout />}
           </div>
         </div>
 
