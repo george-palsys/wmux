@@ -283,11 +283,49 @@ server.tool(
 
 server.tool(
   'pane_list',
-  'List all panes in a workspace with CWD and git branch info. Omit workspaceId to list the active workspace.',
+  'List all panes in a workspace with CWD, git branch, and metadata. Omit workspaceId to list the active workspace.',
   {
     workspaceId: z.string().optional().describe('Target a specific workspace by ID. Omit to use the active workspace.'),
   },
   async ({ workspaceId }) => callRpc('pane.list', workspaceId ? { workspaceId } : {}),
+);
+
+server.tool(
+  'pane_set_metadata',
+  'Attach descriptive metadata (label/role/status + custom k/v) to a leaf pane in the calling workspace. The custom map is deep-merged when merge=true, so cooperating tools can each write their own keys without clobbering. Set merge=false to replace the entire metadata object. Omit paneId to target the active pane in the calling workspace.',
+  {
+    paneId: z.string().optional().describe('Target leaf pane id. Omit to use the active pane in the calling workspace.'),
+    label: z.string().max(64).optional().describe('Short human label, e.g. "Backend".'),
+    role: z.string().max(64).optional().describe('Free-form role tag, e.g. "service" or "test-runner".'),
+    status: z.string().max(128).optional().describe('Current status, e.g. "running-tests".'),
+    custom: z.record(z.string(), z.string()).optional().describe('Additional string→string properties for tool-specific data. Deep-merged with existing custom map when merge=true. Recommended convention: namespace your keys with a tool prefix (e.g. "orchestrator.taskId", "qa.status") to avoid semantic collisions with other cooperating tools.'),
+    merge: z.boolean().optional().describe('Default true (patch + deep-merge custom). Set false to replace the entire metadata object.'),
+  },
+  async ({ paneId, label, role, status, custom, merge }) => {
+    const workspaceId = await requireWorkspaceId();
+    const params: Record<string, unknown> = { workspaceId };
+    if (paneId !== undefined) params['paneId'] = paneId;
+    if (label !== undefined) params['label'] = label;
+    if (role !== undefined) params['role'] = role;
+    if (status !== undefined) params['status'] = status;
+    if (custom !== undefined) params['custom'] = custom;
+    if (merge !== undefined) params['merge'] = merge;
+    return callRpc('pane.setMetadata', params);
+  },
+);
+
+server.tool(
+  'pane_get_metadata',
+  'Read the metadata attached to a leaf pane in the calling workspace. Returns { paneId, metadata } or null metadata if none set.',
+  {
+    paneId: z.string().optional().describe('Target leaf pane id. Omit to use the active pane in the calling workspace.'),
+  },
+  async ({ paneId }) => {
+    const workspaceId = await requireWorkspaceId();
+    const params: Record<string, unknown> = { workspaceId };
+    if (paneId !== undefined) params['paneId'] = paneId;
+    return callRpc('pane.getMetadata', params);
+  },
 );
 
 server.tool(
@@ -302,6 +340,27 @@ server.tool(
     const params: Record<string, unknown> = { workspaceId, query };
     if (regex !== undefined) params.regex = regex;
     return callRpc('pane.search', params);
+  },
+);
+
+server.tool(
+  'wmux_events_poll',
+  'Poll the wmux EventBus for pane and process lifecycle events. Cursor-based: pass `cursor` = the last `seq` you saw (start with 0 to replay from oldest in the ring). Returns { events, nextCursor, resync? }. `resync: true` means your cursor drifted past the in-memory ring (1024 events) and you should reconcile via pane_list. Events are auto-scoped to the calling workspace.',
+  {
+    cursor: z.number().int().nonnegative().optional().describe('Last seen seq number. Default 0 = replay all events still in the ring.'),
+    types: z
+      .array(z.enum(['pane.created', 'pane.closed', 'pane.focused', 'pane.metadata.changed', 'process.started', 'process.exited']))
+      .optional()
+      .describe('Filter to specific event types. Omit to receive all types.'),
+    max: z.number().int().positive().max(1024).optional().describe('Max events to return per poll. Default 256.'),
+  },
+  async ({ cursor, types, max }) => {
+    const workspaceId = await requireWorkspaceId();
+    const params: Record<string, unknown> = { workspaceId };
+    if (cursor !== undefined) params['cursor'] = cursor;
+    if (types !== undefined) params['types'] = types;
+    if (max !== undefined) params['max'] = max;
+    return callRpc('events.poll', params);
   },
 );
 
