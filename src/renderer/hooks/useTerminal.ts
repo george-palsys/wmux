@@ -11,6 +11,7 @@ import { XTERM_THEMES, extractXtermColors, type ThemeId, type BuiltinThemeId } f
 import { pastePtyChunked } from '../utils/clipboardChunk';
 import { runCopyWithFeedback } from '../utils/copyWithFeedback';
 import { shouldFitWhilePreservingSelection } from '../utils/fitGuard';
+import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 
 // Module-level terminal registry for scrollback persistence
 const terminalRegistry = new Map<string, Terminal>();
@@ -245,26 +246,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // for the user to release the mouse, then we push it to the clipboard.
     // Without this, the only path is the explicit Ctrl+C / right-click flow,
     // which loses selections that get wiped by PTY data, focus changes, or
-    // any fit() that slipped past the guards. Debounce coalesces the storm
-    // of onSelectionChange events that fire during a drag (one per cell).
-    //
-    // We deliberately do NOT show the success toast here — the user didn't
-    // press a key, so a flashing "Copied!" would be UI noise. Errors are
-    // also swallowed: the explicit Ctrl+C path will surface them properly
-    // when the user actually presses the keybind.
-    let selectionCopyTimer: ReturnType<typeof setTimeout> | null = null;
-    const SELECTION_COPY_DEBOUNCE_MS = 150;
+    // any fit() that slipped past the guards. The debounce + empty-filter
+    // logic lives in `createAutoSelectionCopy` so it can be unit-tested
+    // without xterm. We deliberately do NOT show the success toast here —
+    // auto-copy wasn't keybind-triggered, so a flashing "Copied!" would be
+    // UI noise. Errors are also silent: the explicit Ctrl+C path still
+    // surfaces them on retry.
+    const autoCopy = createAutoSelectionCopy({
+      write: (text) => window.clipboardAPI.writeText(text),
+    });
     const selectionDisposable = terminal.onSelectionChange(() => {
-      if (selectionCopyTimer) clearTimeout(selectionCopyTimer);
-      selectionCopyTimer = setTimeout(() => {
-        selectionCopyTimer = null;
-        const sel = terminal.getSelection();
-        if (!sel || sel.length === 0) return;
-        void window.clipboardAPI.writeText(sel).catch(() => {
-          // Silent — Ctrl+C / right-click paths still show error toasts
-          // when the user explicitly retries.
-        });
-      }, SELECTION_COPY_DEBOUNCE_MS);
+      autoCopy.onSelection(terminal.getSelection());
     });
 
     // Clipboard + shortcut handling
@@ -625,7 +617,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
 
     return () => {
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
-      if (selectionCopyTimer) clearTimeout(selectionCopyTimer);
+      autoCopy.dispose();
       selectionDisposable.dispose();
       resizeObserver.disconnect();
       removeDataListener?.();
