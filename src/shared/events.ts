@@ -25,13 +25,14 @@
 // can land in the bus in either order. Clients must not assume seq order
 // implies causal order across producer boundaries.
 
-import type { PaneMetadata } from './types';
+import type { PaneMetadata, WorkspaceMetadata } from './types';
 
 export type WmuxEventType =
   | 'pane.created'
   | 'pane.closed'
   | 'pane.focused'
   | 'pane.metadata.changed'
+  | 'workspace.metadata.changed'
   | 'process.started'
   | 'process.exited';
 
@@ -40,6 +41,7 @@ export const WMUX_EVENT_TYPES: readonly WmuxEventType[] = [
   'pane.closed',
   'pane.focused',
   'pane.metadata.changed',
+  'workspace.metadata.changed',
   'process.started',
   'process.exited',
 ] as const;
@@ -74,6 +76,19 @@ export interface PaneMetadataChangedEvent extends WmuxEventBase {
   metadata: PaneMetadata;
 }
 
+/**
+ * Fires when WorkspaceMetadata mutates (cwd, gitBranch, listeningPorts,
+ * status, progress, agentName, agentStatus, lastNotification). The full
+ * post-mutation metadata snapshot is included so clients don't need to
+ * re-query. `patch` carries the keys that the caller actually wrote, so
+ * dashboards can distinguish "user set status" from "shell hook updated cwd".
+ */
+export interface WorkspaceMetadataChangedEvent extends WmuxEventBase {
+  type: 'workspace.metadata.changed';
+  metadata: WorkspaceMetadata;
+  patch: Partial<WorkspaceMetadata>;
+}
+
 export interface ProcessStartedEvent extends WmuxEventBase {
   type: 'process.started';
   ptyId: string;
@@ -93,6 +108,7 @@ export type WmuxEvent =
   | PaneClosedEvent
   | PaneFocusedEvent
   | PaneMetadataChangedEvent
+  | WorkspaceMetadataChangedEvent
   | ProcessStartedEvent
   | ProcessExitedEvent;
 

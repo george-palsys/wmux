@@ -5,7 +5,7 @@
 // main and see pane lifecycle. Failures are swallowed — telemetry never
 // breaks a state mutation.
 
-import type { PaneMetadata } from '../../shared/types';
+import type { PaneMetadata, WorkspaceMetadata } from '../../shared/types';
 import type { WmuxEventType } from '../../shared/events';
 
 interface ElectronEventsAPI {
@@ -45,4 +45,12 @@ export function publishPaneMetadataChanged(
   metadata: PaneMetadata,
 ): void {
   publish({ type: 'pane.metadata.changed', workspaceId, paneId, metadata });
+}
+
+export function publishWorkspaceMetadataChanged(
+  workspaceId: string,
+  metadata: WorkspaceMetadata,
+  patch: Partial<WorkspaceMetadata>,
+): void {
+  publish({ type: 'workspace.metadata.changed', workspaceId, metadata, patch });
 }

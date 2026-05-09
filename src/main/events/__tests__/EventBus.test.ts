@@ -195,6 +195,24 @@ describe('EventBus', () => {
     });
   });
 
+  describe('garbage cursor inputs (review fix follow-up — defensive)', () => {
+    it('Number.MAX_SAFE_INTEGER triggers resync, not silent zero events', () => {
+      bus.emit({ type: 'pane.created', workspaceId: 'ws-1', paneId: 'p1' });
+      bus.emit({ type: 'pane.closed', workspaceId: 'ws-1', paneId: 'p1' });
+
+      const r = bus.poll(Number.MAX_SAFE_INTEGER);
+      expect(r.resync).toBe(true);
+      // After resync we get all remaining events from oldest forward.
+      expect(r.events.length).toBe(2);
+    });
+
+    it('extremely large but finite cursor still triggers resync via cursor>latest', () => {
+      bus.emit({ type: 'pane.created', workspaceId: 'ws-1', paneId: 'p1' });
+      const r = bus.poll(1e15);
+      expect(r.resync).toBe(true);
+    });
+  });
+
   describe('cursor advances under filter (review fix 1a)', () => {
     it('does not re-scan filter no-matches on subsequent polls', () => {
       // 50 pane events, then 5 process events.
