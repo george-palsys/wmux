@@ -11,6 +11,7 @@ import { XTERM_THEMES, extractXtermColors, type ThemeId, type BuiltinThemeId } f
 import { pastePtyChunked } from '../utils/clipboardChunk';
 import { runCopyWithFeedback } from '../utils/copyWithFeedback';
 import { shouldFitWhilePreservingSelection } from '../utils/fitGuard';
+import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 
 // Module-level terminal registry for scrollback persistence
 const terminalRegistry = new Map<string, Terminal>();
@@ -224,6 +225,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         webglAddonRef.current = null;
         loadWebgl();
       }
+      // Selection-preservation guard — this is mostly defensive (fonts.ready
+      // resolves on mount before the user can select anything), but pinning
+      // the contract here prevents future regressions if anything triggers
+      // a font load mid-session.
+      if (!shouldFitWhilePreservingSelection(terminalRef.current)) {
+        console.debug('[Terminal] fonts.ready fit skipped — active selection');
+        return;
+      }
       fitAddon.fit();
       terminal.refresh(0, terminal.rows - 1);
     });
@@ -232,6 +241,23 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     let lastSentCols = 0;
     let lastSentRows = 0;
     let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Auto-copy on selection (debounced) — selection survives just long enough
+    // for the user to release the mouse, then we push it to the clipboard.
+    // Without this, the only path is the explicit Ctrl+C / right-click flow,
+    // which loses selections that get wiped by PTY data, focus changes, or
+    // any fit() that slipped past the guards. The debounce + empty-filter
+    // logic lives in `createAutoSelectionCopy` so it can be unit-tested
+    // without xterm. We deliberately do NOT show the success toast here —
+    // auto-copy wasn't keybind-triggered, so a flashing "Copied!" would be
+    // UI noise. Errors are also silent: the explicit Ctrl+C path still
+    // surfaces them on retry.
+    const autoCopy = createAutoSelectionCopy({
+      write: (text) => window.clipboardAPI.writeText(text),
+    });
+    const selectionDisposable = terminal.onSelectionChange(() => {
+      autoCopy.onSelection(terminal.getSelection());
+    });
 
     // Clipboard + shortcut handling
     terminal.attachCustomKeyEventHandler((e) => {
@@ -591,6 +617,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
 
     return () => {
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
+      autoCopy.dispose();
+      selectionDisposable.dispose();
       resizeObserver.disconnect();
       removeDataListener?.();
       removeExitListener?.();
@@ -630,8 +658,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (!webglAddonRef.current && loadWebglRef.current) {
         loadWebglRef.current();
       }
-      // Defer fit to allow CSS display change to take effect before measuring
+      // Defer fit to allow CSS display change to take effect before measuring.
+      // Selection-preservation guard — workspace/tab switch then immediate
+      // selection + Ctrl+C used to wipe the selection because this fit had
+      // no guard (unlike ResizeObserver and font/theme paths). The next
+      // ResizeObserver tick (after selection is released) handles the
+      // deferred resize naturally.
       const id = requestAnimationFrame(() => {
+        if (!shouldFitWhilePreservingSelection(terminalRef.current)) {
+          console.debug('[Terminal] visibility fit skipped — active selection');
+          return;
+        }
         fit();
       });
       return () => cancelAnimationFrame(id);
