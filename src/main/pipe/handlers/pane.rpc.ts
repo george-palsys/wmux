@@ -174,4 +174,35 @@ export function registerPaneRpc(router: RpcRouter, getWindow: GetWindow): void {
     const workspaceId = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
     return sendToRenderer(getWindow, 'pane.clearMetadata', { paneId, workspaceId });
   });
+
+  /**
+   * pane.search — cross-pane search across a workspace's live panes
+   * params: { query: string, regex?: boolean, workspaceId?: string }
+   *
+   * The `workspaceId` (when present) is forwarded so the renderer handler
+   * (C1 fix) can scope the search to the CALLING workspace rather than
+   * whichever workspace the user happens to be viewing in the UI. Internal
+   * renderer callers omit it and the handler falls back to the active
+   * workspace. Cross-workspace search is deferred to v2 (D9).
+   */
+  router.register('pane.search', (params) => {
+    if (typeof params['query'] !== 'string' || params['query'].length === 0) {
+      return Promise.reject(new Error('pane.search: "query" must be a non-empty string'));
+    }
+    const regex = params['regex'];
+    if (regex !== undefined && typeof regex !== 'boolean') {
+      return Promise.reject(new Error('pane.search: "regex" must be a boolean if provided'));
+    }
+    const workspaceId = params['workspaceId'];
+    if (workspaceId !== undefined && typeof workspaceId !== 'string') {
+      return Promise.reject(
+        new Error('pane.search: "workspaceId" must be a string if provided'),
+      );
+    }
+    return sendToRenderer(getWindow, 'pane.search', {
+      query: params['query'],
+      ...(regex !== undefined && { regex }),
+      ...(workspaceId !== undefined && { workspaceId }),
+    });
+  });
 }

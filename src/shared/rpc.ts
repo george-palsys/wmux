@@ -28,6 +28,7 @@ export type RpcMethod =
   | 'pane.setMetadata'
   | 'pane.getMetadata'
   | 'pane.clearMetadata'
+  | 'pane.search'
   | 'events.poll'
   | 'input.send'
   | 'input.sendKey'
@@ -117,6 +118,7 @@ export const ALL_RPC_METHODS = [
   'pane.setMetadata',
   'pane.getMetadata',
   'pane.clearMetadata',
+  'pane.search',
   'events.poll',
   'input.send',
   'input.sendKey',

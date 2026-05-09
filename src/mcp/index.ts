@@ -329,6 +329,21 @@ server.tool(
 );
 
 server.tool(
+  'wmux_search_panes',
+  'Search across all live terminal panes in the caller\'s workspace. Returns up to 200 matches with paneId + matched line + 2-line context (truncated=true means more were found). Use to find which pane has the JWT error, failing test, or build warning instead of polling each pane individually. Live panes only (v1); regex uses JS RegExp with default flags (case-sensitive, no inline `(?i)` — use `[Ee]rror` for case-insensitive).',
+  {
+    query: z.string().min(1).describe('The text to search for. Required, non-empty. Treated as a literal substring unless regex=true.'),
+    regex: z.boolean().optional().describe('If true, treat query as a JavaScript regex pattern (e.g. "ERROR|WARN", "\\\\bTODO\\\\b"). Default flags only — case-sensitive, no inline `(?i)`. Invalid pattern returns an error. Default false.'),
+  },
+  async ({ query, regex }) => {
+    const workspaceId = await requireWorkspaceId();
+    const params: Record<string, unknown> = { workspaceId, query };
+    if (regex !== undefined) params.regex = regex;
+    return callRpc('pane.search', params);
+  },
+);
+
+server.tool(
   'wmux_events_poll',
   'Poll the wmux EventBus for pane and process lifecycle events. Cursor-based: pass `cursor` = the last `seq` you saw (start with 0 to replay from oldest in the ring). Returns { events, nextCursor, resync? }. `resync: true` means your cursor drifted past the in-memory ring (1024 events) and you should reconcile via pane_list. Events are auto-scoped to the calling workspace.',
   {
