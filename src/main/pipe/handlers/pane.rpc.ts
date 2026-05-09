@@ -36,4 +36,26 @@ export function registerPaneRpc(router: RpcRouter, getWindow: GetWindow): void {
     }
     return sendToRenderer(getWindow, 'pane.split', { direction });
   });
+
+  /**
+   * pane.search — cross-pane search across the current workspace's live panes
+   * params: { query: string, regex?: boolean }
+   *
+   * Validation only happens here; workspace scope is enforced in the renderer
+   * (T-C) since `terminalRegistry` only contains currently-rendered terminals
+   * scoped to workspaces. Cross-workspace search is deferred to v2 (D9).
+   */
+  router.register('pane.search', (params) => {
+    if (typeof params['query'] !== 'string' || params['query'].length === 0) {
+      return Promise.reject(new Error('pane.search: "query" must be a non-empty string'));
+    }
+    const regex = params['regex'];
+    if (regex !== undefined && typeof regex !== 'boolean') {
+      return Promise.reject(new Error('pane.search: "regex" must be a boolean if provided'));
+    }
+    return sendToRenderer(getWindow, 'pane.search', {
+      query: params['query'],
+      ...(regex !== undefined && { regex }),
+    });
+  });
 }
