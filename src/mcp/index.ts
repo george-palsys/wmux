@@ -290,6 +290,21 @@ server.tool(
   async ({ workspaceId }) => callRpc('pane.list', workspaceId ? { workspaceId } : {}),
 );
 
+server.tool(
+  'wmux_search_panes',
+  'Search across all live terminal panes in the calling workspace for a query string. Returns matches with paneId + matched line text + 2 lines of surrounding context, plus an optional pane label when one has been set. Use this when you want to autonomously locate which pane has the JWT error, the failing test, the build warning, the dev-server crash, etc. — instead of polling each pane individually with terminal_read. Scope is the caller\'s own workspace only (cross-workspace search is not exposed in v1). Searches live panes only — i.e. terminal panes currently mounted in the UI; dead-session scrollback dumps are out of scope for v1. Returns up to 200 matches; truncated=true indicates more were found. For substring search pass query alone; for regex set regex=true (invalid regex returns an error).',
+  {
+    query: z.string().min(1).describe('The text to search for. Required, non-empty. Treated as a literal substring unless regex=true.'),
+    regex: z.boolean().optional().describe('If true, treat query as a JavaScript regex pattern (e.g. "ERROR|WARN", "\\\\bTODO\\\\b"). Invalid pattern returns an error. Default false (substring match).'),
+  },
+  async ({ query, regex }) => {
+    const workspaceId = await requireWorkspaceId();
+    const params: Record<string, unknown> = { workspaceId, query };
+    if (regex !== undefined) params.regex = regex;
+    return callRpc('pane.search', params);
+  },
+);
+
 // === A2A (Agent-to-Agent) tools ===
 
 // 1. a2a_whoami — Identify this workspace
