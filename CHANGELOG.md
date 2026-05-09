@@ -5,6 +5,75 @@ All notable changes to wmux are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] — 2026-05-09 — External Tooling Surface + Cross-Pane Search
+
+외부 AI 도구(Claude Code, 서드파티 MCP)가 wmux 위에 워크플로우를 빌드할 수 있도록 세 개의 신규 surface를 동시 도입한 minor 릴리스다. @alphabeen 의 RFC #15 가 직접적인 트리거이며, 그 결과로 (1) pane 단위 metadata API, (2) cursor 기반 JSON-RPC event bus, (3) cross-pane search 가 묶음으로 들어온다. 모든 신규 필드는 optional 이라 기존 클라이언트는 영향 없으며, `system.capabilities().features` 의 새 키 (`paneMetadata`, `events`) 로 신규 표면을 감지할 수 있다.
+
+릴리스 본문이 큰 만큼 데이터 마이그레이션은 없다. 다만 외부 MCP 통합 코드를 작성한 사람은 "Migration Notes" 의 `bootId` / `asOfSeq` 항목을 한 번 읽고 캐시 무효화 경로를 확인할 것.
+
+### Added
+
+- **Pane metadata API** — #16. `PaneLeaf` 에 optional `PaneMetadata { label?, role?, status?, custom?: Record<string,string>, updatedAt? }` 부착. RPC 3 개 (`pane.setMetadata`/`getMetadata`/`clearMetadata`) + MCP tool 2 개 (`pane_set_metadata`, `pane_get_metadata`). 8 KB 직렬화 캡, label ≤ 64, role ≤ 64, status ≤ 128, custom ≤ 32 entries × 64-char keys. 외부 MCP 의 cross-workspace 하이재킹은 `workspaceId` 자동 스코프 + slice 레벨 검증으로 차단 (v2.7.2 `mcp.claimWorkspace` fix 와 같은 클래스 패턴). `custom` 맵은 `merge=true` 일 때 1 단계 deep-merge — 협력하는 두 MCP 가 서로의 키를 덮어쓰지 않는다.
+  구현: `src/shared/types.ts`, `src/shared/rpc.ts`, `src/main/pipe/handlers/pane.rpc.ts`, `src/renderer/stores/slices/paneSlice.ts`, `src/renderer/hooks/useRpcBridge.ts`, `src/mcp/index.ts`.
+
+- **JSON-RPC event bus** — #21 (resubmit of #17, base-deleted artifact). `WmuxEventType` union: `pane.created` / `pane.closed` / `pane.focused` / `pane.metadata.changed` / `workspace.metadata.changed` / `process.started` / `process.exited`. In-memory ring (1024 events) + monotonic `seq` cursor. RPC `events.poll({cursor, types?, workspaceId?, max?})` + MCP tool `wmux_events_poll`. 외부 도구는 자기 워크스페이스 이벤트만 자동 스코프. `bootId` (UUIDv4 / EventBus 인스턴스마다 변경) 가 `events.poll` / `system.capabilities` / `pane.list` 응답에 모두 노출되어 데몬 재시작 시 클라이언트 캐시(pane id, pty id, cursor) 를 깨끗이 무효화할 수 있다. `pane.list` 는 envelope `{asOfSeq, bootId, panes}` 로 변경되어 resync 후 reconcile 의 frame of reference 를 명확히 한다. polling 만 — push/SSE 는 stdio MCP transport 와 안 맞아 deferred.
+  구현: `src/shared/events.ts`, `src/main/events/EventBus.ts`, `src/main/pipe/handlers/events.rpc.ts`, `src/renderer/events/publisher.ts`, `src/renderer/stores/slices/searchSlice.ts`.
+
+- **Cross-pane search** — #20. wmux 의 첫 cross-pane primitive. `Ctrl+F` 의 "All Panes" 토글로 현재 워크스페이스 모든 live pane 의 xterm.js 버퍼를 on-demand grep 한다. 결과 ≤ 10 개는 search bar dropdown, > 10 개는 하단 panel 자동 확장 (progressive disclosure UX with hysteresis: open at > 10, close at ≤ 5, sticky bit until session reset). 결과 클릭 → 해당 pane focus + `scrollToLine(physicalBaseY)` 로 wrapped line 까지 정확히 jump. regex 모드 + 잘못된 패턴 visual error (red border + tooltip, no toast). MCP tool `wmux_search_panes(query, regex?)` 로 외부 AI 도 자율 추론 가능 ("JWT 에러 단 pane" 같은). 200-result cap, 20k lines/pane scan cap, 500-char line truncation. cross-workspace 검색은 v2 deferred (RPC-layer caller-identity gate 추가 설계 필요).
+  구현: `src/renderer/utils/searchEngine.ts`, `src/renderer/components/Terminal/SearchBar.tsx`, `src/renderer/components/Search/SearchResultsPanel.tsx`, `src/renderer/stores/slices/searchSlice.ts`, `src/mcp/index.ts`. i18n: en/ko/ja/zh 4 locale 모두 신규 키 추가.
+
+### Changed
+
+- **`pane.list` 응답 형태** — `PaneListEntry[]` → `{asOfSeq: number, bootId: string, panes: PaneListEntry[]}` envelope. resync 시 클라이언트가 "이 스냅샷 이후 events" 를 정확히 결정할 수 있다. `panes[]` 는 기존 키 그대로 + 새 `metadata?: PaneMetadata` 필드 추가. 기존 클라이언트는 envelope unwrap 후 `.panes` 만 사용하면 되며, `metadata` 는 optional 이라 무시해도 됨.
+
+- **`system.capabilities` 응답 확장** — `methods: RpcMethod[]` 만 있던 응답에 `features: { paneMetadata: true, events: { types, maxRingSize, bootId } }` 추가. 기존 `methods` 배열은 변경 없이 신규 method 들이 자동 추가된다 (`'pane.setMetadata'`, `'pane.getMetadata'`, `'pane.clearMetadata'`, `'pane.search'`, `'events.poll'`).
+
+### Security
+
+- **Cross-workspace pane.search 누출 차단** — RPC handler 가 caller 가 보낸 `workspaceId` 를 우선 사용하고 fallback 으로만 active workspace 를 쓴다. 외부 MCP 가 자기 ws 컨텍스트로 검색 호출 시, 사용자가 다른 ws 를 보고 있어도 caller 의 ws 결과만 받는다. v2.7.2 `mcp.claimWorkspace` fix 와 동일 클래스의 보안 게이트.
+- **Pane metadata cross-ws 하이재킹 차단** — `pane.setMetadata` / `pane.clearMetadata` 도 `workspaceId` 스코프 강제. 외부 MCP 가 사용자 보는 ws 에 임의 metadata 작성 불가.
+
+### Fixed
+
+- **Clipboard selection 잔존 fix** — #19. v2.7.4 에서 도입한 selection-preserving fit 가드가 `isVisible` useEffect 와 `document.fonts.ready` 콜백 두 곳에 누락돼 워크스페이스 전환 직후나 폰트 로드 직후 selection 이 wipe 되던 문제. 또 selection 후 명시적 Ctrl+C 사이에 PTY 출력으로 selection 이 자연 클리어되어 SIGINT 가 가던 문제. fix: 두 가드 추가 + `terminal.onSelectionChange` 기반 자동 복사 (150 ms debounce, main-IPC 경유로 1 MB cap·Win32 lock retry·error toast 모두 보존). 해당 layer 9 unit tests 추가.
+  구현: `src/renderer/hooks/useTerminal.ts`, `src/renderer/utils/autoSelectionCopy.ts` (신규).
+
+### Migration Notes
+
+- **외부 MCP 통합 코드** 는 `wmux_search_panes` / `wmux_events_poll` / `pane_get_metadata` 등 신규 도구를 즉시 사용할 수 있다. 신규 surface 감지는 `system.capabilities().features.paneMetadata` 와 `features.events` 키로.
+- **`pane.list` 호출자** 는 응답이 envelope 으로 바뀐 점을 반영해야 한다. 기존 코드가 `panes[0].id` 처럼 직접 인덱싱했다면 `result.panes[0].id` 로. 단, MCP `pane_list` tool 은 envelope 그대로 반환하므로 AI 에이전트는 자연어로 처리 가능.
+- **이벤트 폴링 클라이언트** 는 매 응답의 `bootId` 를 비교하고, 변경됐다면 cached pane id / pty id / cursor 를 모두 폐기하고 `pane.list` 로 reconcile. `cursor > latestSeq()` 또는 `resync: true` 도 동일하게 처리.
+
+### v1 deferred → v2 candidates
+
+다음 항목들은 본 릴리스 범위 밖으로 명시 deferred — 트래킹 #18 :
+
+- Cross-workspace search 및 metadata write (현재 caller ws 만 — explicit setting + RPC-layer caller-identity gate 설계 필요)
+- Push / SSE event delivery (stdio MCP 와 어울리지 않음, 폴링 latency 가 UX 문제 될 때 재검토)
+- Dead session scrollback dump 검색 (live pane 만 v1)
+- Optimistic concurrency (`expectedVersion`) on `meta.set` — 다중 도구 contention 시 last-writer-wins 를 깨끗이 분리
+
+## [2.7.4] — 2026-05-07 — Terminal Stability (4-bug Fix)
+
+v2.7.0 의 UI 확장 후 누적된 터미널 안정성 4 건을 묶은 patch. 모두 사용자 가시 회귀라 우선 ship. 데이터 마이그레이션 없음.
+
+### Fixed
+
+- **Hang / CPU 풀가동 (큰 출력)** — `PTYBridge.ts` onData 에 8 ms micro-batch 도입. `OscParser.ts` 가 slice 기반(O(n²) → O(n)). `ActivityMonitor.ts` 가 100 ms 타임스탬프 가드.
+- **Ctrl+V paste 일부 누락** — `useTerminal.ts` 의 Ctrl+V / Ctrl+Shift+V 핸들러에 4096 청킹 추가 (우클릭 path 와 동일). `pty.handler.ts` 100 K silent drop backstop 은 유지하되 `console.warn` 추가.
+- **Copy 완전 안 됨** — `clipboard.handler.ts` silent return 3 건을 typed throw (`CLIPBOARD_INVALID_TYPE` / `CLIPBOARD_TOO_LARGE` / `CLIPBOARD_WRITE_FAILED`) 로 변환. 4 호출부 (useTerminal ×3 + Terminal.tsx) 가 await + try/catch, 실패 시 selection 유지 + `showCopyErrorToast` (i18n 4 locale).
+- **마지막 문단만 복사** — `useTerminal.ts` ResizeObserver / font-theme effect 에 `hasSelection()` 가드 + `windowsPty: { backend: 'conpty', buildNumber: 21376 }` 옵션으로 ConPTY reflow 활성화 (xterm.js 6 의 SelectionService unconditional clear 우회).
+
+### Changed
+
+- `IPC.CLIPBOARD_WRITE` invoke 가 실패 시 throw — renderer 는 await + try/catch 필수.
+- `IPC.PTY_DATA` 송신 빈도가 청크 단위 → 8 ms batch 단위 (데이터 내용 / 순서 동일).
+- `IPC.PTY_WRITE` 100K 초과 silent drop backstop 은 유지 — renderer 가 청킹으로 회피해야 함.
+
+### Migration Notes
+
+스키마 변경 없음. `clipboardAPI.writeText` 를 호출하는 신규 코드는 await + try/catch 필수.
+
 ## [2.7.3] — 2026-04-28 — A2A Execute Approval Gate
 
 외부 MCP 호출자가 `a2a_task_send` 의 `execute:true` 한 줄로 사용자의
