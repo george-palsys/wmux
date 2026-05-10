@@ -252,7 +252,9 @@ export function useKeyboard() {
       }
 
       // Ctrl+D: Split right (horizontal)
-      if (cmdOrCtrl && !shift && !alt && key === 'd') {
+      // Match by physical key code as well so Hangul / non-Latin IME state
+      // (where e.key may be 'ㅇ' or 'Process') still triggers the split.
+      if (cmdOrCtrl && !shift && !alt && (key === 'd' || code === 'KeyD')) {
         e.preventDefault();
         const state = store.getState();
         const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
@@ -263,7 +265,7 @@ export function useKeyboard() {
       }
 
       // Ctrl+Shift+D: Split down (vertical)
-      if (cmdOrCtrl && shift && !alt && key === 'D') {
+      if (cmdOrCtrl && shift && !alt && (key === 'D' || code === 'KeyD')) {
         e.preventDefault();
         const state = store.getState();
         const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
@@ -286,7 +288,11 @@ export function useKeyboard() {
         return;
       }
 
-      // Ctrl+W: Close surface
+      // Ctrl+W: Close active surface. If it was the last surface in the pane,
+      // also collapse the pane so split layouts can actually be torn down via
+      // the keyboard. Mirrors the X-button cascade in Pane.tsx (line 85) — the
+      // tab strip path was the only way to reach closePane before, and single-
+      // tab panes don't render a tab strip at all.
       if (cmdOrCtrl && !shift && !alt && key === 'w') {
         e.preventDefault();
         const state = store.getState();
@@ -298,8 +304,30 @@ export function useKeyboard() {
           if (surface?.ptyId) {
             window.electronAPI.pty.dispose(surface.ptyId);
           }
+          const wasLastSurface = activePane.surfaces.length <= 1;
           state.closeSurface(activePane.id, activePane.activeSurfaceId);
+          if (wasLastSurface) {
+            // Non-root panes collapse here; root pane is a no-op (paneSlice
+            // refuses to drop it) so AppLayout's empty-leaf effect refills it
+            // with a fresh PTY — same behaviour as before for the lone pane.
+            state.closePane(activePane.id);
+          }
         }
+        return;
+      }
+
+      // Ctrl+Shift+Q: Close active pane outright (tmux 'kill-pane' direct key).
+      // Disposes every PTY in the subtree first so background terminals don't
+      // leak when the pane disappears. Matches the prefix-mode 'closePane'
+      // action so users have both a discoverable shortcut and the tmux flow.
+      if (cmdOrCtrl && shift && !alt && key === 'Q') {
+        e.preventDefault();
+        const state = store.getState();
+        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+        if (!ws) return;
+        const activeLeaf = findLeaf(ws.rootPane, ws.activePaneId);
+        if (activeLeaf) disposePanePtys(activeLeaf);
+        state.closePane(ws.activePaneId);
         return;
       }
 

@@ -344,6 +344,13 @@ export default function AppLayout() {
         setShowAutoUpdatePrompt(true);
       }
 
+      // v2.8.1 hotfix (Bug 3): defer reconciliation until main has
+      // settled the daemon-vs-local decision. Without this gate, the
+      // reconcile fires while IPC handlers are mid-swap and pty.list
+      // can hit a "no handler registered" rejection — the renderer
+      // surfaces that as a generic "알 수 없는 오류" toast spam.
+      await window.electronAPI.daemon.whenReady();
+
       await reconcilePtys();
     });
   }, []);
@@ -440,17 +447,22 @@ export default function AppLayout() {
   // Auto-create initial surface for empty leaf panes (supports both single-leaf and preset branch roots)
   // 세션 복원된 경우: surfaces가 이미 있으므로 이 effect는 실행되지 않음
   // 브라우저 surface만 있는 pane: surfaceType이 'browser'이면 PTY 생성 스킵
+  // Deps include the joined empty-leaf id signature so that splitPane (which adds
+  // a new empty leaf without changing the workspace id) re-triggers PTY creation.
+  // Without this, a freshly split pane stays as the "빈 창" placeholder forever.
+  type LeafPane = import('../../../shared/types').PaneLeaf;
+  const collectEmptyLeaves = (pane: import('../../../shared/types').Pane): LeafPane[] => {
+    if (pane.type === 'leaf') {
+      return pane.surfaces.length === 0 ? [pane] : [];
+    }
+    return pane.children.flatMap(collectEmptyLeaves);
+  };
+  const emptyLeafIdsKey = activeWorkspace
+    ? collectEmptyLeaves(activeWorkspace.rootPane).map((l) => l.id).join('|')
+    : '';
+
   useEffect(() => {
     if (!activeWorkspace) return;
-
-    // Collect all empty leaf panes from the tree
-    type LeafPane = import('../../../shared/types').PaneLeaf;
-    const collectEmptyLeaves = (pane: import('../../../shared/types').Pane): LeafPane[] => {
-      if (pane.type === 'leaf') {
-        return pane.surfaces.length === 0 ? [pane] : [];
-      }
-      return pane.children.flatMap(collectEmptyLeaves);
-    };
 
     const emptyLeaves = collectEmptyLeaves(activeWorkspace.rootPane);
     if (emptyLeaves.length === 0) return;
@@ -480,7 +492,8 @@ export default function AppLayout() {
     }
 
     return () => { cancelled = true; };
-  }, [activeWorkspace?.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- collectEmptyLeaves & addSurface are stable; emptyLeafIdsKey is the meaningful trigger
+  }, [activeWorkspace?.id, emptyLeafIdsKey]);
 
   // Wizard close handler (T8a). Mirrors firstRunCompleted into uiSlice (main
   // already wrote the marker via firstRun:complete or :dismiss). The cheat

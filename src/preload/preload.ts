@@ -125,6 +125,22 @@ const electronAPI = {
       ipcRenderer.on('daemon:connected', listener);
       return () => { ipcRenderer.removeListener('daemon:connected', listener); };
     },
+    /**
+     * Resolves once main has finalized the daemon-vs-local decision.
+     * Returns `{ connected: bool }` reflecting the CURRENT state at
+     * invoke time (so a renderer reloaded after the daemon disconnected
+     * mid-session sees the live answer, not a stale "connected at
+     * startup" record).
+     *
+     * Implemented as `ipcRenderer.invoke` rather than a one-shot event
+     * listener so renderers created after main already decided — for
+     * example, the `mainWindow.reload()` paths used by renderer crash
+     * recovery — can still query the state on demand. An event-based
+     * promise would deadlock here because the event was already
+     * consumed by the previous (now-destroyed) preload instance.
+     */
+    whenReady: (): Promise<{ connected: boolean }> =>
+      ipcRenderer.invoke('daemon:get-ready-state') as Promise<{ connected: boolean }>,
   },
   mcp: {
     check: () => ipcRenderer.invoke(IPC.MCP_CHECK) as Promise<McpStatusPayload>,
@@ -157,6 +173,19 @@ const electronAPI = {
       ipcRenderer.on(IPC.TOKEN_UPDATE, listener);
       return () => { ipcRenderer.removeListener(IPC.TOKEN_UPDATE, listener); };
     },
+  },
+  window: {
+    hide: () => ipcRenderer.send(IPC.WINDOW_HIDE),
+  },
+  events: {
+    /**
+     * One-way publish of a pane lifecycle event to the main-process EventBus.
+     * Caller passes a partial event object (`type`, `workspaceId`, plus
+     * type-specific fields); main stamps `seq` and `ts`. Failures are
+     * swallowed — telemetry must never break a state mutation.
+     */
+    publish: (input: { type: string; workspaceId: string; [k: string]: unknown }) =>
+      ipcRenderer.send(IPC.EVENTS_PUBLISH, input),
   },
   scrollback: {
     dump: (surfaceId: string, content: string) =>
