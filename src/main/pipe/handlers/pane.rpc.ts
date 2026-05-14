@@ -1,107 +1,108 @@
 import type { BrowserWindow } from 'electron';
 import type { RpcRouter } from '../RpcRouter';
 import { sendToRenderer } from './_bridge';
-import {
-  PANE_METADATA_MAX_BYTES,
-  PANE_METADATA_LABEL_MAX,
-  PANE_METADATA_ROLE_MAX,
-  PANE_METADATA_STATUS_MAX,
-  PANE_METADATA_CUSTOM_KEY_MAX,
-  PANE_METADATA_CUSTOM_MAX_ENTRIES,
-} from '../../../shared/types';
-import { eventBus } from '../../events/EventBus';
+import type { PaneMetadata } from '../../../shared/types';
+import { metadataStore, type MergeMode, type MetadataStore } from '../../metadata/MetadataStore';
 
 type GetWindow = () => BrowserWindow | null;
 
-interface MetadataPatchInput {
-  label?: unknown;
-  role?: unknown;
-  status?: unknown;
-  custom?: unknown;
+// === Validation single source of truth ===
+//
+// Field-level metadata validation (label/role/status string + length caps,
+// custom-map key/value contract, total byte cap) lives in MetadataStore.set.
+// The handler only normalizes wire-shape — paneId/workspaceId resolution,
+// mergeMode + expectedVersion type checks — and forwards a raw patch.
+// Two parallel validators (one here, one in the store) was alphabeen's
+// drift-risk concern on PR #34: with shared constants, near-identical
+// switch arms, and zero compile-time link between them, the two paths
+// would silently fork as caps or rules evolve. The store throws on every
+// rejection; the handler wraps with its RPC-method prefix and surfaces
+// the message verbatim. See docs/PROTOCOL.md §1.2.
+
+/**
+ * Options for registerPaneRpc — exposed so tests can inject a fresh
+ * MetadataStore instance instead of the module-level singleton.
+ */
+export interface PaneRpcOptions {
+  store?: MetadataStore;
 }
 
-interface SanitizedPatch {
-  label?: string;
-  role?: string;
-  status?: string;
-  custom?: Record<string, string>;
-}
-
-function sanitizeMetadataPatch(input: MetadataPatchInput): SanitizedPatch | { error: string } {
-  const out: SanitizedPatch = {};
-
-  if (input.label !== undefined) {
-    if (typeof input.label !== 'string') return { error: '"label" must be a string' };
-    if (input.label.length > PANE_METADATA_LABEL_MAX) {
-      return { error: `"label" exceeds ${PANE_METADATA_LABEL_MAX} chars` };
-    }
-    out.label = input.label;
-  }
-  if (input.role !== undefined) {
-    if (typeof input.role !== 'string') return { error: '"role" must be a string' };
-    if (input.role.length > PANE_METADATA_ROLE_MAX) {
-      return { error: `"role" exceeds ${PANE_METADATA_ROLE_MAX} chars` };
-    }
-    out.role = input.role;
-  }
-  if (input.status !== undefined) {
-    if (typeof input.status !== 'string') return { error: '"status" must be a string' };
-    if (input.status.length > PANE_METADATA_STATUS_MAX) {
-      return { error: `"status" exceeds ${PANE_METADATA_STATUS_MAX} chars` };
-    }
-    out.status = input.status;
-  }
-  if (input.custom !== undefined) {
-    if (
-      typeof input.custom !== 'object' ||
-      input.custom === null ||
-      Array.isArray(input.custom)
-    ) {
-      return { error: '"custom" must be an object of string→string' };
-    }
-    const entries = Object.entries(input.custom);
-    if (entries.length > PANE_METADATA_CUSTOM_MAX_ENTRIES) {
-      return { error: `"custom" exceeds ${PANE_METADATA_CUSTOM_MAX_ENTRIES} entries` };
-    }
-    const custom: Record<string, string> = {};
-    for (const [k, v] of entries) {
-      if (k.length === 0) {
-        return { error: '"custom" key cannot be empty' };
-      }
-      if (k.length > PANE_METADATA_CUSTOM_KEY_MAX) {
-        return { error: `"custom" key exceeds ${PANE_METADATA_CUSTOM_KEY_MAX} chars` };
-      }
-      if (typeof v !== 'string') {
-        return { error: `"custom.${k}" must be a string` };
-      }
-      custom[k] = v;
-    }
-    out.custom = custom;
-  }
-
-  // Hard cap on serialized size — prevents bloated session.json.
-  if (JSON.stringify(out).length > PANE_METADATA_MAX_BYTES) {
-    return { error: `metadata exceeds ${PANE_METADATA_MAX_BYTES} bytes` };
-  }
-  return out;
-}
-
-export function registerPaneRpc(router: RpcRouter, getWindow: GetWindow): void {
+export function registerPaneRpc(
+  router: RpcRouter,
+  getWindow: GetWindow,
+  opts: PaneRpcOptions = {},
+): void {
+  const store = opts.store ?? metadataStore;
   /**
    * pane.list — returns all panes (leaf nodes) of the current workspace,
    * wrapped in a snapshot envelope. `asOfSeq` is the EventBus seq at the
-   * moment of the snapshot — clients reconciling after a `resync` should
-   * drain events with `seq > asOfSeq`. `bootId` invalidates cached state
-   * across daemon restarts (mismatch ⇒ drop ALL caches, including pane ids).
+   * moment of the MetadataStore snapshot — clients reconciling after a
+   * `resync` should drain events with `seq > asOfSeq`. `bootId` invalidates
+   * cached state across daemon restarts (mismatch ⇒ drop ALL caches,
+   * including pane ids).
    *
-   * Wire shape: `{ asOfSeq: number, bootId: string, panes: PaneListEntry[] }`.
+   * M0-c: each pane entry is augmented with `metadata` + `version` joined
+   * from MetadataStore.snapshot(). We call the renderer FIRST and only then
+   * capture the metadata snapshot, so `asOfSeq` reflects the EventBus state
+   * at or after the pane tree the client receives. Clients can then safely
+   * drain events with `seq > asOfSeq` without double-applying a `pane.created`
+   * for a pane the snapshot already contains. Metadata mutations that happen
+   * during the gap are delivered as ordinary events, so final consistency is
+   * preserved (codex P2).
+   *
+   * Fallback order for `metadata` per pane:
+   *   1. MetadataStore entry (authoritative once M0-e SessionManager hydration
+   *      lands)
+   *   2. `l.metadata` from the renderer response — preserves v2.x session
+   *      metadata for panes restored from disk before M0-e wires hydration
+   *   3. `{}` — never-seen pane, identical to MetadataStore.get() shape
+   * `version` follows the same priority: store version → 0 (the renderer
+   * does not track a version field on PaneLeaf).
+   *
+   * Wire shape:
+   *   { asOfSeq: number, bootId: string,
+   *     panes: Array<PaneListEntry & { metadata: PaneMetadata, version: number }> }
    */
   router.register('pane.list', async (params) => {
-    const panes = await sendToRenderer(getWindow, 'pane.list', params);
+    // 1. Fetch the pane tree from the renderer.
+    const panes = (await sendToRenderer(getWindow, 'pane.list', params)) as Array<
+      Record<string, unknown> & { id?: unknown; metadata?: unknown }
+    >;
+
+    // 2. THEN snapshot the metadata store. asOfSeq is anchored to the pane
+    //    tree we just received: any event with seq > asOfSeq describes a
+    //    delta relative to the panes[] the client is about to read.
+    const snapshot = store.snapshot();
+    const metadataByPaneId = new Map<string, { metadata: PaneMetadata; version: number }>();
+    for (const entry of snapshot.entries) {
+      metadataByPaneId.set(entry.paneId, {
+        metadata: entry.metadata,
+        version: entry.version,
+      });
+    }
+
+    const joined = panes.map((pane) => {
+      const paneId = typeof pane.id === 'string' ? pane.id : '';
+      const found = metadataByPaneId.get(paneId);
+      // Renderer-provided metadata is the M0-e bridge: until SessionManager
+      // hydrates MetadataStore from session.json, restored panes only carry
+      // their saved metadata on PaneLeaf.metadata. Falling back to it here
+      // keeps v2.x sessions intact during the M0 rollout.
+      const rendererMetadata =
+        pane.metadata && typeof pane.metadata === 'object' && !Array.isArray(pane.metadata)
+          ? (pane.metadata as PaneMetadata)
+          : undefined;
+      return {
+        ...pane,
+        metadata: found?.metadata ?? rendererMetadata ?? {},
+        version: found?.version ?? 0,
+      };
+    });
+
     return {
-      asOfSeq: eventBus.latestSeq(),
-      bootId: eventBus.bootId,
-      panes,
+      asOfSeq: snapshot.asOfSeq,
+      bootId: snapshot.bootId,
+      panes: joined,
     };
   });
 
@@ -131,48 +132,236 @@ export function registerPaneRpc(router: RpcRouter, getWindow: GetWindow): void {
   });
 
   /**
-   * pane.setMetadata — set descriptive metadata on a leaf pane.
-   * params: { paneId?, workspaceId?, label?, role?, status?, custom?, merge? }
-   * External MCP callers SHOULD pass workspaceId so writes stay scoped to the
-   * caller's workspace and don't get hijacked to whichever ws the user is
-   * currently viewing. paneId omitted → active pane in the targeted workspace.
-   * merge defaults to true (patch-style); false replaces the metadata object.
+   * Resolves the target pane for a metadata RPC. Two paths:
+   *
+   *   - `paneId` provided: ask the renderer to confirm the paneId actually
+   *     belongs to `workspaceId` (or, when workspaceId is omitted, to any
+   *     workspace) via the internal `pane.validateWorkspace` channel.
+   *     MetadataStore is keyed by paneId only — without this check an MCP
+   *     scoped to workspace A could pass B's paneId + its own workspaceId
+   *     and read/write B's metadata (codex P1, M0-d follow-up). The renderer
+   *     holds the authoritative pane tree, so it's the right place to ask.
+   *   - `paneId` omitted: ask the renderer for the active leaf via the
+   *     `pane.resolveActiveLeaf` channel. Read-only; paneSlice is not
+   *     mutated. The resolved leaf id is already scoped to the workspace
+   *     the renderer answered for, so no additional check is needed.
+   *
+   * Both channels are renderer-internal — they never expose metadata
+   * patches; the renderer only answers "is this pane in that workspace"
+   * (validate) or "which leaf is active" (resolve). MetadataStore remains
+   * the sole writer on the metadata surface.
    */
-  router.register('pane.setMetadata', (params) => {
+  async function resolveTarget(
+    paneId: string | undefined,
+    workspaceId: string | undefined,
+  ): Promise<{ paneId: string; workspaceId: string | undefined }> {
+    if (paneId) {
+      // M0-d follow-up (codex P1) — workspace membership check. MetadataStore
+      // is keyed by paneId only, so without this an MCP scoped to workspace
+      // A could pass B's paneId together with its own workspaceId and quietly
+      // read/mutate B's metadata. pane.list still uses the renderer tree-walk
+      // path (no resolveTarget call), so this only adds one IPC per
+      // set/get/clear write — well below the resolveActiveLeaf budget the
+      // paneId-omitted path already pays.
+      const validation = (await sendToRenderer(getWindow, 'pane.validateWorkspace', {
+        paneId,
+        workspaceId,
+      })) as { paneId?: string; workspaceId?: string; error?: string };
+      if (validation.error || !validation.paneId) {
+        throw new Error(validation.error ?? 'pane.validateWorkspace: pane not found');
+      }
+      return {
+        paneId: validation.paneId,
+        // When the caller omitted workspaceId, use the workspaceId the
+        // renderer just confirmed — it's the authoritative value for
+        // event scoping on the subsequent MetadataStore write.
+        workspaceId: workspaceId ?? validation.workspaceId,
+      };
+    }
+    const resolved = (await sendToRenderer(getWindow, 'pane.resolveActiveLeaf', {
+      workspaceId,
+    })) as { paneId?: string; workspaceId?: string; error?: string };
+    if (resolved.error || !resolved.paneId) {
+      throw new Error(resolved.error ?? 'unable to resolve active leaf pane');
+    }
+    return {
+      paneId: resolved.paneId,
+      workspaceId: workspaceId ?? resolved.workspaceId,
+    };
+  }
+
+  /**
+   * pane.setMetadata — set descriptive metadata on a leaf pane.
+   * params: { paneId?, workspaceId?, label?, role?, status?, custom?,
+   *           merge?, mergeMode?, expectedVersion? }
+   *
+   * M0-b: MetadataStore is the sole writer for metadata. If the caller
+   * omits paneId, the handler resolves the active leaf via the internal
+   * `pane.resolveActiveLeaf` channel (renderer answers with the leaf id;
+   * no paneSlice write happens) and then commits via MetadataStore.set().
+   *
+   * M0-f wire-format spec:
+   *   - `mergeMode` (v2.9.0+) — 'merge' | 'replace' | 'replaceShared'.
+   *     Wins over the legacy `merge` boolean when both are present.
+   *   - `merge` (v2.8.x legacy) — true → 'merge', false → 'replace'.
+   *     Default 'merge' when neither field is present.
+   *   - `expectedVersion` (v2.9.0+) — optimistic concurrency guard.
+   *     Mismatch returns VERSION_CONFLICT and does not mutate.
+   *   - Reply now includes `version` (additive — v2.8.x destructures of
+   *     { ok, paneId, metadata } keep working).
+   *
+   * External MCP callers SHOULD pass workspaceId so writes stay scoped to
+   * the caller's workspace and don't get hijacked to whichever ws the user
+   * is currently viewing.
+   */
+  router.register('pane.setMetadata', async (params) => {
     const paneId = typeof params['paneId'] === 'string' ? params['paneId'] : undefined;
     const workspaceId = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
-    const merge = params['merge'] !== false; // default true
 
-    const sanitized = sanitizeMetadataPatch(params as MetadataPatchInput);
-    if ('error' in sanitized) {
-      return Promise.reject(new Error(`pane.setMetadata: ${sanitized.error}`));
+    // M0-f: explicit `mergeMode` wins over legacy `merge:boolean`. When
+    // mergeMode is undefined we fall back to the legacy `merge` boolean
+    // (v2.8.x compatibility); when it's provided we accept the three
+    // documented modes and reject everything else. An earlier draft
+    // silently fell back on a wrong-typed value (e.g. mergeMode: 'foo')
+    // which masked client bugs — codex P2.
+    const mergeModeParam = params['mergeMode'];
+    let mergeMode: MergeMode;
+    if (mergeModeParam === undefined) {
+      mergeMode = params['merge'] === false ? 'replace' : 'merge';
+    } else if (
+      mergeModeParam === 'merge' ||
+      mergeModeParam === 'replace' ||
+      mergeModeParam === 'replaceShared'
+    ) {
+      mergeMode = mergeModeParam;
+    } else {
+      throw new Error(
+        'pane.setMetadata: "mergeMode" must be one of "merge", "replace", "replaceShared"',
+      );
     }
-    return sendToRenderer(getWindow, 'pane.setMetadata', {
-      paneId,
-      workspaceId,
-      patch: sanitized,
-      merge,
-    });
+
+    // M0-f: expectedVersion is the optimistic-concurrency guard. An
+    // earlier draft coerced wrong-typed values (e.g. the string "1" from
+    // a CLI/env serialization path) to undefined, which silently bypassed
+    // the guard and turned the call into an unconditional write. Reject
+    // anything that isn't a non-negative integer up front — codex P2.
+    let expectedVersion: number | undefined;
+    if (params['expectedVersion'] !== undefined) {
+      const ev = params['expectedVersion'];
+      if (typeof ev !== 'number' || !Number.isInteger(ev) || ev < 0) {
+        throw new Error(
+          'pane.setMetadata: "expectedVersion" must be a non-negative integer',
+        );
+      }
+      expectedVersion = ev;
+    }
+
+    // Wire-shape extraction only — actual field validation (types, caps,
+    // custom-map contract) is the store's job. Cast targets are safe because
+    // MetadataStore.set runs sanitize() up front and throws on every shape
+    // violation; the catch below wraps with the RPC-method prefix.
+    const patch: Partial<PaneMetadata> = {};
+    if (params['label'] !== undefined) patch.label = params['label'] as string;
+    if (params['role'] !== undefined) patch.role = params['role'] as string;
+    if (params['status'] !== undefined) patch.status = params['status'] as string;
+    if (params['custom'] !== undefined) patch.custom = params['custom'] as Record<string, string>;
+
+    let target: { paneId: string; workspaceId: string | undefined };
+    try {
+      target = await resolveTarget(paneId, workspaceId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`pane.setMetadata: ${msg}`);
+    }
+
+    let result;
+    try {
+      // Passing workspaceId through unchanged (including undefined) lets
+      // MetadataStore fall back to the pane's remembered workspaceId, so a
+      // legacy paneId-only call doesn't clear the scope established by an
+      // earlier write. store.set runs sanitize() before any mutation, so a
+      // bad payload throws here without bumping the version.
+      result = store.set(target.paneId, patch, {
+        mergeMode,
+        workspaceId: target.workspaceId,
+        ...(expectedVersion !== undefined && { expectedVersion }),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`pane.setMetadata: ${msg}`);
+    }
+    if (!result.ok) {
+      // VERSION_CONFLICT — RpcRouter currently only propagates the error
+      // message string; we embed `currentVersion=N` so clients can parse
+      // the right base for a retry. Structured error envelopes (with
+      // `code: RPC_VERSION_CONFLICT` and `data.currentVersion`) are
+      // future work — see src/shared/rpc.ts for the type stubs.
+      throw new Error(
+        `pane.setMetadata: ${result.error} (currentVersion=${result.currentVersion})`,
+      );
+    }
+    // M0-f wire-format reply: { ok, paneId, metadata, version }. The
+    // `version` field is additive — v2.8.x clients that only read the
+    // first three keys keep working.
+    return {
+      ok: true,
+      paneId: target.paneId,
+      metadata: result.metadata,
+      version: result.version,
+    };
   });
 
   /**
    * pane.getMetadata — read metadata for a leaf pane.
-   * params: { paneId?, workspaceId? } — omitted workspaceId → active workspace.
+   * params: { paneId?, workspaceId? } — omitted paneId resolves to the
+   * active leaf via the same `pane.resolveActiveLeaf` channel setMetadata
+   * uses, so reads always see the latest MetadataStore state for the same
+   * pane that a subsequent write would target.
    */
-  router.register('pane.getMetadata', (params) => {
+  router.register('pane.getMetadata', async (params) => {
     const paneId = typeof params['paneId'] === 'string' ? params['paneId'] : undefined;
     const workspaceId = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
-    return sendToRenderer(getWindow, 'pane.getMetadata', { paneId, workspaceId });
+
+    let target: { paneId: string; workspaceId: string | undefined };
+    try {
+      target = await resolveTarget(paneId, workspaceId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`pane.getMetadata: ${msg}`);
+    }
+
+    const entry = store.get(target.paneId);
+    // M0-f wire-format reply: { paneId, metadata, version }. `version` is
+    // additive — v2.8.x clients reading { paneId, metadata } keep working.
+    return { paneId: target.paneId, metadata: entry.metadata, version: entry.version };
   });
 
   /**
    * pane.clearMetadata — drop all metadata for a leaf pane.
    * params: { paneId?, workspaceId? }
+   *
+   * Same resolution as setMetadata. The renderer is consulted only to
+   * resolve the active leaf; the actual clear happens against MetadataStore.
    */
-  router.register('pane.clearMetadata', (params) => {
+  router.register('pane.clearMetadata', async (params) => {
     const paneId = typeof params['paneId'] === 'string' ? params['paneId'] : undefined;
     const workspaceId = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
-    return sendToRenderer(getWindow, 'pane.clearMetadata', { paneId, workspaceId });
+
+    let target: { paneId: string; workspaceId: string | undefined };
+    try {
+      target = await resolveTarget(paneId, workspaceId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`pane.clearMetadata: ${msg}`);
+    }
+
+    const result = store.clear(target.paneId);
+    // M0-f wire-format reply: { ok, paneId, version }. Version is the
+    // post-clear monotonic counter (bumped by store.clear). v2.8.x clients
+    // that only read { ok, paneId } continue to work.
+    return result.ok
+      ? { ok: true, paneId: target.paneId, version: result.version }
+      : { ok: false, paneId: target.paneId, error: result.error };
   });
 
   /**

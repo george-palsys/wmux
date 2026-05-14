@@ -36,6 +36,11 @@ import { createTray, destroyTray } from './tray';
 import { FirstRunOrchestrator } from './firstRun/FirstRunOrchestrator';
 import { registerFirstRunHandlers } from './firstRun';
 import { ProcessMonitor } from '../daemon/ProcessMonitor';
+import { metadataStore } from './metadata/MetadataStore';
+import { collectLegacyMetadata } from './metadata/legacyMigration';
+import { sessionManager, registerSessionHandlers } from './ipc/handlers/session.handler';
+import { eventBus } from './events/EventBus';
+import { initLogSink, logLine } from './util/logSink';
 
 // Force English for Chromium internal messages to avoid encoding corruption
 // on non-ASCII locales (e.g. Korean Windows where cp949 garbles console output).
@@ -222,6 +227,17 @@ const mcpHandlerOptions = {
   },
 };
 
+// Register session + scrollback handlers ONCE, outside the registerAllHandlers
+// swap cycle. These channels (session:load/save, scrollback:load/dump) only
+// depend on the local sessionManager singleton and have no daemon-mode vs
+// local-mode variant, so there is no reason to tear them down on daemon
+// connect/disconnect. Keeping them in the swap cycle exposed renderer
+// scrollback.load to a microsecond "No handler registered" rejection window
+// on cold boot, which silently destroyed previous-session scrollback when
+// the post-restore 5s autosave dumped the empty/fresh buffer over it.
+// Same hardening pattern as the v2.8.1 Bug 3 fix for `daemon:get-ready-state`.
+registerSessionHandlers();
+
 let cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, mcpHandlerOptions);
 
 // First-run wizard orchestrator (Plan 1.15) — registered once and survives
@@ -316,6 +332,11 @@ ipcMain.handle('browser:register-webview', async (_event, surfaceId: string, web
 
 console.log('[DEBUG] registering app.on(ready)');
 app.on('ready', async () => {
+  // Persistent log sink — must come first so every subsequent stderr write
+  // and explicit logLine() call lands on disk for postmortem analysis.
+  // Path: %APPDATA%\wmux\logs\main-YYYY-MM-DD.log (Windows default).
+  initLogSink();
+  logLine('info', 'main', 'app.on(ready) fired');
   console.log('[Main] App ready, creating window...');
 
   // Populate the native About panel (macOS shows this automatically in
@@ -336,6 +357,19 @@ app.on('ready', async () => {
 
   mainWindow = createWindow();
   console.log(`[Main] Window created: ${!!mainWindow}`);
+  logLine('info', 'main', `window created: present=${!!mainWindow}`);
+
+  // Relay renderer console messages (warn + error) into the persistent log
+  // file so renderer-side instrumentation (e.g. useTerminal scrollback
+  // .catch) survives the postmortem cycle. level enum: 0=verbose, 1=info,
+  // 2=warning, 3=error. We capture 2 and 3 only — verbose/info from
+  // renderer would otherwise drown the signal we care about.
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level < 2) return;
+    const lvl: 'warn' | 'error' = level === 3 ? 'error' : 'warn';
+    const where = sourceId ? `${sourceId}:${line}` : 'renderer';
+    logLine(lvl, 'renderer', `${where} — ${message}`);
+  });
 
   attachWindowRecovery(mainWindow);
 
@@ -369,8 +403,18 @@ app.on('ready', async () => {
       if (authOk) {
         daemonClient = client;
         console.log('[Main] Connected to wmux-daemon (auth verified)');
+        // Instrumentation: handler swap race investigation. The cleanup →
+        // re-register sequence below tears down IPC handlers (including
+        // scrollback:load) for a microsecond window. If the renderer's bulk
+        // useTerminal mount fires scrollback.load during this window, the
+        // invokes reject silently and the post-boot autosave overwrites the
+        // previous scrollback files. Logging the exact swap boundary so we
+        // can correlate with renderer-side .catch traces.
+        logLine('info', 'main', 'handler swap (daemon connect): cleanup begin');
         cleanupHandlers();
+        logLine('info', 'main', 'handler swap (daemon connect): cleanup done, register begin');
         cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, daemonClient, mcpHandlerOptions);
+        logLine('info', 'main', 'handler swap (daemon connect): register done');
         // Mount the notification router now that we have a live daemon
         // client. PTY data flows through daemon → DaemonClient events, and
         // this router translates them into the same renderer-facing IPC
@@ -386,8 +430,11 @@ app.on('ready', async () => {
           daemonNotificationRouter?.stop();
           daemonNotificationRouter = null;
           daemonClient = null;
+          logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup begin');
           cleanupHandlers();
+          logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup done, register begin');
           cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, mcpHandlerOptions);
+          logLine('warn', 'main', 'handler swap (daemon disconnect): register done');
         });
       }
     }
@@ -484,6 +531,88 @@ app.on('ready', async () => {
   mainWindow.webContents.on('did-finish-load', () => {
     console.log('[Main] Page loaded successfully');
   });
+  // M0-e — hydrate MetadataStore from disk, then wire the persist callback
+  // so subsequent `metadataStore.set/clear/onPaneDeleted` flush to disk
+  // BEFORE the `pane.metadata.changed` event publishes (race spec #1).
+  //
+  // Hydrate first, then wire — otherwise the hydrate path itself would
+  // re-trigger a persist write of state we just read from disk.
+  //
+  // M0-f follow-up (codex P2): v2.8.x → v2.9.0 migration. When
+  // `metadata.json` does not exist yet (first boot after upgrade),
+  // `loadMetadata()` returns null. `session.json` still carries every
+  // user-set label/role/status/custom on `PaneLeaf.metadata`. Without the
+  // lift below, `pane.list` would still render correctly (it falls back
+  // to the renderer's PaneLeaf.metadata — M0-c P2 fix) but
+  // `pane.getMetadata` would return `{}/version 0`, and the next
+  // merge-mode write would silently drop the legacy fields. We migrate
+  // them into the store and persist immediately so the second boot uses
+  // metadata.json as the source of truth and skips this branch.
+  try {
+    const persistedMetadata = sessionManager.loadMetadata();
+    if (persistedMetadata) {
+      metadataStore.hydrate(persistedMetadata);
+    } else {
+      const session = sessionManager.load();
+      if (session) {
+        const migrated = collectLegacyMetadata(session);
+        if (migrated.length > 0) {
+          // Hydrate directly, then persist synchronously. The persist
+          // callback is wired AFTER this block so hydrate() does not
+          // recursively trigger saveMetadataSync; we drive the initial
+          // write here explicitly so the next boot reads metadata.json.
+          metadataStore.hydrate({ schema_version: 1, entries: migrated });
+          try {
+            sessionManager.saveMetadataSync(metadataStore.serialize());
+            console.log(
+              `[boot] migrated ${migrated.length} legacy PaneLeaf.metadata entries to MetadataStore`,
+            );
+          } catch (persistErr) {
+            // Non-fatal: hydrate succeeded and the in-memory store has the
+            // legacy data, so this boot is correct. The next mutation goes
+            // through the persist callback below and will retry the write.
+            console.error('[Main] legacy metadata persist failed:', persistErr);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Main] metadata hydrate failed; starting clean:', err);
+  }
+  metadataStore.setPersist((shape) => {
+    sessionManager.saveMetadataSync(shape);
+  });
+
+  // Final-review follow-up (P0-1): wire pane lifecycle into MetadataStore.
+  //
+  // Without this subscriber, `MetadataStore.onPaneDeleted()` had no
+  // production caller — only unit tests exercised it. Two consequences:
+  //   1. `metadata.json` grew monotonically as panes were created/closed;
+  //      every closed pane left a tombstone slot in the in-memory map and,
+  //      worse, kept its label/role/status durably on disk.
+  //   2. After daemon restart, `hydrate()` re-seeded every closed-pane
+  //      entry, so `pane.list` and `pane.getMetadata` would surface
+  //      metadata for paneIds that no longer existed in the renderer's
+  //      pane tree — ghost panes resurrected on every boot.
+  //
+  // The renderer publishes `pane.closed` through preload IPC (see
+  // `registerHandlers.ts` `onEventsPublish`), which lands as an
+  // `eventBus.emit(...)` call. We subscribe to the main-side EventBus so
+  // any future producer of `pane.closed` (PTYBridge, daemon broadcast)
+  // gets the same tombstone treatment without duplicating the wiring.
+  eventBus.subscribe((event) => {
+    if (event.type !== 'pane.closed') return;
+    try {
+      metadataStore.onPaneDeleted(event.paneId);
+    } catch (err) {
+      // onPaneDeleted swallows persist failures internally; this catch
+      // is a belt-and-suspenders guard against a future refactor that
+      // throws synchronously (e.g. a validate step). The pane-close
+      // signal must never propagate an error back to the emitter.
+      console.error('[Main] metadataStore.onPaneDeleted failed:', err);
+    }
+  });
+
   // Write auth token BEFORE starting pipe server — prevents race where
   // MCP client reads old token while new pipe is already listening
   const authToken = pipeServer.getAuthToken();

@@ -537,8 +537,22 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       window.electronAPI.scrollback.load(scrollbackFile).then((content) => {
-        if (content && terminalRef.current === terminal) {
+        // Skip the entire branch if the terminal was disposed during the
+        // async IPC round-trip. Without this, the pendingData flush below
+        // would write into a torn-down terminal on fast unmount + remount
+        // (e.g. workspace switch mid-restore).
+        if (terminalRef.current !== terminal) return;
+        if (content) {
           terminal.write(content);
+          // Whitespace + ANSI reset boundary so restored scrollback doesn't
+          // visually fuse with the fresh PTY prompt drawn moments later.
+          // \x1b[0m closes any attribute left open by restored content; the
+          // surrounding \r\n pair guards cursor placement when restored
+          // content doesn't end on a newline and gives the new prompt one
+          // blank line of headroom. No text label — Search/copy/vi-copy
+          // would otherwise treat a localized divider string as real shell
+          // output.
+          terminal.write('\r\n\x1b[0m\r\n');
           fireFirstData();
         }
         scrollbackLoaded = true;
@@ -547,16 +561,38 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         if (pendingData.length > 0) fireFirstData();
         pendingData.length = 0;
-      }).catch(() => {
+        // Register with the scrollback autosave only after restore
+        // completes. Setting it synchronously before the async load lets
+        // the 5s autosave tick dump an empty/partial buffer over the
+        // previous scrollback file on disk.
+        terminalRegistry.set(ptyId, terminal);
+      }).catch((err) => {
+        // Instrumentation: surface the real failure reason. Previously this
+        // catch silently swallowed errors, including "No handler registered
+        // for 'scrollback:load'" rejections that occur during the main-side
+        // IPC handler swap window (daemon connect, src/main/index.ts).
+        // Without this log, a failed restore is indistinguishable from a
+        // legitimately empty scrollback file, and the next 5s autosave
+        // overwrites the previous (intact) file on disk with the fresh PTY
+        // prompt — destroying the user's prior session output. The renderer
+        // console.error is mirrored into the main-side log file by the
+        // webContents `console-message` listener in src/main/index.ts.
+        const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        // eslint-disable-next-line no-console
+        console.error(`[useTerminal] scrollback.load FAILED surfaceFile=${scrollbackFile} ptyId=${ptyId} err=${msg}`);
+        if (terminalRef.current !== terminal) return;
         scrollbackLoaded = true;
         for (const data of pendingData) {
           terminal.write(data);
         }
         if (pendingData.length > 0) fireFirstData();
         pendingData.length = 0;
+        terminalRegistry.set(ptyId, terminal);
       });
     } else {
       connectPty();
+      // No scrollback to restore — register immediately for fresh terminals.
+      terminalRegistry.set(ptyId, terminal);
     }
 
     // Resize PTY on initial fit — only when we actually have valid dimensions.
@@ -567,8 +603,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       window.electronAPI.pty.resize(ptyId, cols, rows);
     }
 
-    // Register in terminal registry for scrollback persistence
-    terminalRegistry.set(ptyId, terminal);
+    // Terminal registry registration is now per-branch above:
+    //   - scrollback branch: after restore completes (Race B guard)
+    //   - fresh branch: immediately after connectPty()
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
@@ -658,8 +695,22 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       console.debug('[Terminal] font/theme fit skipped — active selection');
       return;
     }
+    // Visibility guard — when the workspace tab containing this terminal is
+    // hidden (display:none) the container has zero dimensions and fit() will
+    // collapse cols to a tiny value. That reflows the in-memory buffer to
+    // one or two characters per physical row; the next scrollback dump
+    // persists that garbled state to disk and on the next launch the user
+    // sees an "empty / column-of-chars" terminal. The other fit() sites in
+    // this hook (initial mount, ResizeObserver, fonts.ready, visibility
+    // watcher, `fit` callback) already have this guard — font/theme was
+    // the last unguarded site.
+    const container = containerRef.current;
+    if (!container || container.offsetWidth === 0 || container.offsetHeight === 0) {
+      console.debug('[Terminal] font/theme fit skipped — container has zero dimensions');
+      return;
+    }
     fitAddonRef.current?.fit();
-  }, [terminalFontSize, terminalFontFamily, xtermTheme]);
+  }, [terminalFontSize, terminalFontFamily, xtermTheme, containerRef]);
 
   // Manage WebGL lifecycle based on visibility.
   // Load WebGL when visible (GPU-accelerated rendering), dispose when hidden

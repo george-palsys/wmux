@@ -40,6 +40,50 @@ function isAllowedShell(shell: string): boolean {
 }
 
 /**
+ * Recovery PTY mute race retry (v2.9.0-rc.2 fix for the symptom reported
+ * during v2.9.0-rc.1 dogfood).
+ *
+ * After a reboot, recovery sessions spawn with `deferOutput=true` so the
+ * bridge starts muted. `DaemonSessionManager.resizeSession` is what
+ * unmutes the bridge (Line 290-298) — but only after `attachSession`
+ * has registered the session. If useTerminal's first `pty:resize` RPC
+ * lands before `daemon.attachSession` completes, the daemon throws
+ * "Session 'X' not found", and a one-shot swallow would leave the
+ * bridge muted forever. Symptom to the user: input reaches the PTY,
+ * PowerShell processes it, but every echo and command output gets
+ * dropped. Looks like "input doesn't work" on every recovered pane.
+ *
+ * The retry rides out the attach race without reordering daemon-side
+ * attach/resize. That ordering reorder (commit 7d5fee3) was reverted
+ * in e032ae3 because it hit an OSC 7 ConPTY interaction — see the
+ * e032ae3 revert message for the v2.9.1 fix plan; this is the
+ * "retry-on-not-found in pty.handler.ts pty:resize" option.
+ *
+ * Retry budget: 50 attempts * 20ms = up to ~1s total. The initial
+ * v2.9.0-rc.2 try (5 * 20 = 80ms) was empirically too short during
+ * dogfood — daemon attach can stretch into hundreds of ms or more
+ * on a cold-restart, especially if multiple panes mass-mount and
+ * each invokes attach back-to-back. 1s gives real headroom while
+ * staying well under any human-perceptible delay.
+ *
+ * Cost in steady state: zero. Retry only fires on "not found",
+ * which only happens during the attach window. A normal resize
+ * (drag, splitter move, font change) returns on attempt 0.
+ *
+ * The final attempt's not-found is still swallowed gracefully so
+ * post-dispose / reconciliation races keep the prior behavior
+ * (the silent return existed for a reason — see git blame).
+ *
+ * A diagnostic console line fires whenever the retry actually rode
+ * out >=1 attempt, so we can measure real-world attach latency from
+ * dogfood logs and decide whether the budget needs further tuning
+ * or whether option (2) — renderer-side attach-await-then-fit — is
+ * worth the larger blast radius.
+ */
+const RESIZE_RETRY_ATTEMPTS = 50;
+const RESIZE_RETRY_DELAY_MS = 20;
+
+/**
  * Validate and resolve cwd. Returns undefined if invalid.
  * Shared by both daemon and local modes.
  */
@@ -192,6 +236,11 @@ export function registerPTYHandlers(
   // while the user is typing (see idleSuppression.ts).
   ipcMain.removeAllListeners(IPC.PTY_WRITE);
   if (useDaemon && daemonClient) {
+    // Per-session diagnostic: log the first dropped write so silent
+    // input-mute leaves a paper trail in main.log without spamming on
+    // every keystroke if a pipe stays dead. Reset when a write succeeds
+    // so future regressions still log their first occurrence.
+    const writeDropLogged = new Set<string>();
     const onPtyWrite = (_event: Electron.IpcMainEvent, id: string, data: string): void => {
       if (typeof data !== 'string') return;
       if (data.length > 100_000) {
@@ -199,7 +248,15 @@ export function registerPTYHandlers(
         return; // prevent mega-writes
       }
       markUserWrite(id);
-      daemonClient.writeToSession(id, sanitizePtyText(data));
+      const delivered = daemonClient.writeToSession(id, sanitizePtyText(data));
+      if (!delivered) {
+        if (!writeDropLogged.has(id)) {
+          writeDropLogged.add(id);
+          console.warn(`[PTY_WRITE] drop sessionId=${id} reason=no-live-session-pipe (first occurrence; suppressing further logs for this id until next successful write)`);
+        }
+      } else if (writeDropLogged.has(id)) {
+        writeDropLogged.delete(id);
+      }
     };
     ipcMain.on(IPC.PTY_WRITE, onPtyWrite);
   } else {
@@ -229,13 +286,45 @@ export function registerPTYHandlers(
         throw new Error(`PTY_RESIZE: cols and rows must be positive integers (got cols=${cols}, rows=${rows})`);
       }
       markResize(id);
-      try {
-        await daemonClient.rpc('daemon.resizeSession', { id, cols, rows });
-      } catch (err: unknown) {
-        // Session may have been destroyed during reconciliation — ignore gracefully
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('not found') || msg.includes('not exist')) return;
-        throw err;
+
+      // Retry on "not found" to ride out the recovery-PTY attach race
+      // (see RESIZE_RETRY_ATTEMPTS doc block above for the full story).
+      // Non-"not found" errors throw immediately. The final attempt's
+      // not-found is swallowed gracefully to preserve the prior
+      // reconciliation-destroyed-session behavior.
+      for (let attempt = 0; attempt < RESIZE_RETRY_ATTEMPTS; attempt++) {
+        try {
+          await daemonClient.rpc('daemon.resizeSession', { id, cols, rows });
+          if (attempt > 0) {
+            // Diagnostic: log how many retries the attach race needed.
+            // Stays cheap (one log line per recovery, not per resize).
+            const elapsedMs = attempt * RESIZE_RETRY_DELAY_MS;
+            // eslint-disable-next-line no-console
+            console.log(
+              `[pty:resize] attach race retry succeeded for ${id} ` +
+              `after ${attempt + 1} attempts (~${elapsedMs}ms wait)`,
+            );
+          }
+          return;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const isNotFound = msg.includes('not found') || msg.includes('not exist');
+          if (!isNotFound) throw err;
+          if (attempt === RESIZE_RETRY_ATTEMPTS - 1) {
+            // Final attempt also failed with not-found: graceful return.
+            // Session genuinely gone (destroyed during reconciliation,
+            // or post-dispose race). Preserves prior swallow behavior.
+            const elapsedMs = RESIZE_RETRY_ATTEMPTS * RESIZE_RETRY_DELAY_MS;
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[pty:resize] attach race retry exhausted for ${id} ` +
+              `after ${RESIZE_RETRY_ATTEMPTS} attempts (~${elapsedMs}ms). ` +
+              `Session may be genuinely gone, or attach is taking >${elapsedMs}ms.`,
+            );
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, RESIZE_RETRY_DELAY_MS));
+        }
       }
     }));
   } else {
@@ -293,9 +382,23 @@ export function registerPTYHandlers(
           return { success: false, error: 'Session not found or dead' };
         }
 
-        // Ensure attached and session pipe connected
+        // Reconnect is an explicit fresh-attach intent — pass forceFresh
+        // so a stale sessionPipes entry (left over from a prior daemon
+        // pipe replacement) is torn down rather than silently reused.
+        // Without this, attach+connect can return success while the
+        // underlying socket is moments away from receiving its close
+        // event, and every subsequent write silently disappears.
         await daemonClient.rpc('daemon.attachSession', { id });
-        await daemonClient.connectSessionPipe(id);
+        await daemonClient.connectSessionPipe(id, { forceFresh: true });
+
+        // Health probe: confirm the freshly connected pipe is actually
+        // writable before reporting success. A truthy reconnect that
+        // points at a dead socket is the exact shape of the input-mute
+        // bug we're trying to prevent here.
+        const probeOk = daemonClient.isSessionPipeWritable(id);
+        if (!probeOk) {
+          return { success: false, error: 'Session pipe not writable after reconnect' };
+        }
 
         // Set up data forwarding. Routed through the per-id helper so a
         // repeat reconnect (e.g. AppLayout's reconcile firing again on the

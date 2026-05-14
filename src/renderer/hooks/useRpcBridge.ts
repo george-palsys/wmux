@@ -371,64 +371,72 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     return { ok: true };
   }
 
-  if (method === 'pane.setMetadata') {
-    // Workspace scoping: external MCP callers MUST pass workspaceId so writes
-    // can't be hijacked into whichever workspace the user happens to focus.
-    // Internal callers may omit it and fall back to the active workspace.
+  if (method === 'pane.resolveActiveLeaf') {
+    // M0-b internal IPC: main asks the renderer to resolve the active leaf
+    // pane for a workspace. Used when an external RPC caller omits `paneId`
+    // and we need to forward the active selection to MetadataStore. Read-only
+    // — does not write to paneSlice; only returns the current active leaf id
+    // and the resolved workspaceId so the next write hits the right pane.
+    //
+    // This channel keeps MetadataStore as the sole metadata writer: the
+    // renderer never sees the patch, it only answers "which leaf is active?".
     const wsId = typeof params.workspaceId === 'string' && params.workspaceId.length > 0
       ? params.workspaceId
       : store.activeWorkspaceId;
     const ws = store.workspaces.find((w) => w.id === wsId);
-    if (!ws) return { error: `pane.setMetadata: workspace "${wsId}" not found` };
-    const paneId = typeof params.paneId === 'string' && params.paneId.length > 0
-      ? params.paneId
-      : ws.activePaneId;
-    const target = findPaneById(ws.rootPane, paneId);
+    if (!ws) return { error: `pane.resolveActiveLeaf: workspace "${wsId}" not found` };
+    const target = findPaneById(ws.rootPane, ws.activePaneId);
     if (!target || target.type !== 'leaf') {
-      return { error: `pane.setMetadata: leaf pane "${paneId}" not found in workspace "${wsId}"` };
+      return { error: `pane.resolveActiveLeaf: active pane is not a leaf in workspace "${wsId}"` };
     }
-    const patch = (params.patch && typeof params.patch === 'object' ? params.patch : {}) as Partial<import('../../shared/types').PaneMetadata>;
-    const merge = params.merge !== false;
-    try {
-      store.setPaneMetadata(paneId, patch, { merge, workspaceId: wsId });
-    } catch (err) {
-      return { error: err instanceof Error ? err.message : String(err) };
-    }
-    return { ok: true, paneId, metadata: useStore.getState().getPaneMetadata(paneId, { workspaceId: wsId }) };
+    return { paneId: target.id, workspaceId: wsId };
   }
 
-  if (method === 'pane.getMetadata') {
-    const wsId = typeof params.workspaceId === 'string' && params.workspaceId.length > 0
-      ? params.workspaceId
-      : store.activeWorkspaceId;
-    const ws = store.workspaces.find((w) => w.id === wsId);
-    if (!ws) return { error: `pane.getMetadata: workspace "${wsId}" not found` };
-    const paneId = typeof params.paneId === 'string' && params.paneId.length > 0
-      ? params.paneId
-      : ws.activePaneId;
+  if (method === 'pane.validateWorkspace') {
+    // M0-d follow-up (codex P1): main asks the renderer to confirm that a
+    // caller-supplied `paneId` actually belongs to the caller's `workspaceId`.
+    // MetadataStore is keyed by paneId only, so without this check an MCP
+    // scoped to workspace A could pass B's paneId together with its own
+    // workspaceId and quietly read/write B's metadata via the paneId-present
+    // branch of `resolveTarget` in `pane.rpc.ts`. The renderer holds the
+    // authoritative pane tree, so we ask it.
+    //
+    // Read-only — does not mutate paneSlice. Returns the authoritative
+    // workspaceId on success so the handler can scope events even if the
+    // caller omitted `workspaceId` (paneId-only legacy calls).
+    const paneId = typeof params.paneId === 'string' ? params.paneId : '';
+    const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
+    if (paneId.length === 0) {
+      return { error: 'pane.validateWorkspace: paneId required' };
+    }
+    // When the caller passed an explicit workspaceId, we MUST scope the
+    // lookup to it — otherwise we'd defeat the whole check (finding the
+    // pane in another workspace and then claiming it belonged to the
+    // caller's). When workspaceId is omitted, we scan every workspace so
+    // a legacy paneId-only call still works.
+    const ws = workspaceId.length > 0
+      ? store.workspaces.find((w) => w.id === workspaceId)
+      : store.workspaces.find((w) => findPaneById(w.rootPane, paneId) !== null);
+    if (!ws) {
+      return {
+        error: workspaceId.length > 0
+          ? `pane.validateWorkspace: workspace "${workspaceId}" not found`
+          : `pane.validateWorkspace: paneId "${paneId}" not in any workspace`,
+      };
+    }
     const target = findPaneById(ws.rootPane, paneId);
     if (!target || target.type !== 'leaf') {
-      return { error: `pane.getMetadata: leaf pane "${paneId}" not found in workspace "${wsId}"` };
+      return {
+        error: `pane.validateWorkspace: leaf "${paneId}" not in workspace "${ws.id}"`,
+      };
     }
-    return { paneId, metadata: target.metadata };
+    return { paneId, workspaceId: ws.id };
   }
 
-  if (method === 'pane.clearMetadata') {
-    const wsId = typeof params.workspaceId === 'string' && params.workspaceId.length > 0
-      ? params.workspaceId
-      : store.activeWorkspaceId;
-    const ws = store.workspaces.find((w) => w.id === wsId);
-    if (!ws) return { error: `pane.clearMetadata: workspace "${wsId}" not found` };
-    const paneId = typeof params.paneId === 'string' && params.paneId.length > 0
-      ? params.paneId
-      : ws.activePaneId;
-    const target = findPaneById(ws.rootPane, paneId);
-    if (!target || target.type !== 'leaf') {
-      return { error: `pane.clearMetadata: leaf pane "${paneId}" not found in workspace "${wsId}"` };
-    }
-    store.clearPaneMetadata(paneId, { workspaceId: wsId });
-    return { ok: true, paneId };
-  }
+  // M0-d: pane.setMetadata / pane.getMetadata / pane.clearMetadata handlers
+  // were removed. After M0-b the main process routes those RPCs straight
+  // through MetadataStore and never calls sendToRenderer for them, so these
+  // branches were unreachable dead code. MetadataStore is the sole writer.
 
   if (method === 'pane.search') {
     const query = String(params['query'] ?? '');

@@ -28,9 +28,9 @@ import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, Surface, Workspace } from '../../../shared/types';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { isFileDrag } from '../../../shared/dragDrop';
-import { Terminal } from '@xterm/xterm';
 import { terminalRegistry } from '../../hooks/useTerminal';
 import { withDefaultShell } from '../../utils/ptyCreateOptions';
+import { serializeTerminalBuffer } from '../../utils/scrollbackDump';
 
 /** Map shell executable path to a human-readable display name. */
 function shellDisplayName(shellPath: string): string {
@@ -45,26 +45,6 @@ function shellDisplayName(shellPath: string): string {
   // Strip extension and capitalize
   const name = base.replace(/\.exe$/i, '');
   return name.charAt(0).toUpperCase() + name.slice(1);
-}
-
-/** Serialize an xterm Terminal buffer to plain text.
- *  Only includes lines up to the cursor position (skips empty viewport padding). */
-function serializeTerminalBuffer(terminal: Terminal): string {
-  const buffer = terminal.buffer.active;
-  // Only read up to baseY + cursorY (actual content), not the full viewport
-  const lastLine = buffer.baseY + buffer.cursorY;
-  const lines: string[] = [];
-  for (let i = 0; i <= lastLine && i < buffer.length; i++) {
-    const line = buffer.getLine(i);
-    if (line) {
-      lines.push(line.translateToString(true));
-    }
-  }
-  // Trim trailing empty lines
-  while (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop();
-  }
-  return lines.join('\r\n');
 }
 
 /** Collect all terminal surfaces from a pane tree */
@@ -211,6 +191,17 @@ export default function AppLayout() {
   const [isDragging, setIsDragging] = useState(false);
   const dragCounterRef = useRef(0);
   const sessionLoadedRef = useRef(false);
+  // Guard against concurrent reconcilePtys runs. The startup-time
+  // `daemon.whenReady()` path and the `daemon.onConnected` listener both
+  // fire reconcilePtys, and on first connect they race: two reconcile
+  // loops interleave and call pty.reconnect twice for the same surface,
+  // which trips a race inside pty:reconnect (attachSession +
+  // connectSessionPipe run twice against the same session). One of the
+  // two reconnects loses, the renderer clears ptyId, and that pane goes
+  // input-mute after a reboot/restore. The flag lets the second caller
+  // skip while the first run owns reconciliation; genuinely late
+  // reconnects after the first run completes are still re-reconciled.
+  const reconcileInFlightRef = useRef(false);
 
   useEffect(() => {
     // File drop via preload onFileDrop (reliable cross-platform)
@@ -269,20 +260,27 @@ export default function AppLayout() {
   // If a saved ptyId exists in the daemon, reconnect to it.
   // Otherwise, clear it so Terminal.tsx creates a fresh PTY.
   const reconcilePtys = useCallback(async () => {
-    const listResult = await ipcInvoke<{ id: string }[]>(() =>
-      window.electronAPI.pty.list()
-    );
-    if (!listResult.ok) {
-      // Toast already shown by useIpc; skip reconciliation silently.
-      console.error('[AppLayout] PTY reconciliation aborted:', listResult.error.code);
+    if (reconcileInFlightRef.current) {
+      // Drop duplicate concurrent trigger. The in-flight run will see
+      // the same daemon state, so re-running would just re-issue the
+      // same reconnects and race against them.
+      console.log('[AppLayout] reconcile already in flight — skipping duplicate trigger');
       return;
     }
+    reconcileInFlightRef.current = true;
     try {
+      const listResult = await ipcInvoke<{ id: string }[]>(() =>
+        window.electronAPI.pty.list()
+      );
+      if (!listResult.ok) {
+        // Toast already shown by useIpc; skip reconciliation silently.
+        console.error('[AppLayout] PTY reconciliation aborted:', listResult.error.code);
+        return;
+      }
       const activePtys = listResult.data;
       const activeIds = new Set(activePtys.map((p: { id: string }) => p.id));
       console.log('[AppLayout] Daemon active PTYs:', [...activeIds]);
 
-      const state = useStore.getState();
       const reconcile = async (pane: Pane, wsId: string) => {
         if (pane.type === 'leaf') {
           for (const surface of pane.surfaces) {
@@ -317,13 +315,20 @@ export default function AppLayout() {
         }
       };
 
-      for (const ws of state.workspaces) {
+      // Iterate the freshest workspace snapshot per walk. The reconcile
+      // path was previously seeded from a single getState() before the
+      // loop, which froze the view of workspaces for the duration of
+      // the walk — any concurrent store update (e.g. a fast-spawned
+      // surface) was invisible until the next reconcile cycle.
+      for (const ws of useStore.getState().workspaces) {
         console.log(`[AppLayout] Reconciling workspace: ${ws.name}`);
         await reconcile(ws.rootPane, ws.id);
       }
       console.log('[AppLayout] Reconciliation complete');
     } catch (err) {
       console.error('[AppLayout] PTY reconciliation failed:', err);
+    } finally {
+      reconcileInFlightRef.current = false;
     }
   }, [ipcInvoke]);
 
