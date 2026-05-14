@@ -5,6 +5,63 @@ All notable changes to wmux are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] — 2026-05-14 — Substrate 3.0 — Phase 0 + M0
+
+wmux의 substrate identity 를 v3.0 으로 끌고 가기 위한 첫 번째 ship unit. v2.8.x 에서 이미 ~50% 가 출하돼 있던 substrate 표면 (PaneMetadata, EventBus, bootId, asOfSeq, `system.capabilities`, MCP host, `mcp.claimWorkspace`) 위에 (a) 그 표면의 contract 를 명문화한 Phase 0 문서, (b) main process 측 metadata authority 인 `MetadataStore` 와 그 wire 통합 (M0-a~f), (c) v2.8.x dogfood 중 노출된 스크롤백 손상 + reconcile race + logSink durable write 안정성 픽스를 한꺼번에 ship. **메인 PR 은 #34** (Substrate 3.0 — Phase 0 + M0, v2.9.0 ship unit) 이고 후속 마이그레이션 도구는 **#35** (chopped-dump recovery tool) 로 따라간다. 외부 RFC 협의는 **#15 (@alphabeen)** 에서 진행됐고 그 OCC + `mergeMode` 디자인이 코드로 착지.
+
+업그레이드 영향:
+
+- 와이어 contract 는 v2.x 와 backwards-compatible 이다 (`expectedVersion`, `mergeMode`, `pane.metadata.changed` 의 `version` 모두 additive optional).
+- 디스크에 새로 등장하는 폴더: `userData/wmux/scrollback/corrupted/` 와 `scrollback/*.txt.bak[.1..3]` 회전 슬롯. 둘 다 자동 관리.
+- v2.8.x 사용자가 첫 부팅 때 일부 패널 스크롤백이 비어 보일 수 있다 — 이미 디스크에 chopped 형태로 저장돼 있던 dump 가 v2.9.0 detector 에 의해 격리되기 때문. 데이터는 격리 폴더에 보존되며 `scripts/recover-scrollback.mjs` 로 사람이 읽을 수 있는 텍스트로 복원 가능. 자세한 가이드는 `docs/upgrade-v2.9.0.md` 참조.
+
+### Added
+
+- **Substrate 3.0 contract documentation** — `docs/PROTOCOL.md` (substrate wire contract: layered status, namespacing, optimistic concurrency, `mergeMode`, cursor opaqueness, snapshot reconciliation, permission enforcement sketch, Named Pipe token security model), `docs/api/{inventory,versioning,stability}.md` (모든 RPC/MCP/event 의 stability tier + semver + 자동 업데이트 호환 정책), `docs/internal/{m0-design,paneSlice-callsite-inventory}.md` (M0 race specs + paneSlice 변경 blast-radius).
+- **`MetadataStore` 모듈 (M0-a)** — main process 의 `PaneMetadata` authority. `get` / `set` / `clear` / `snapshot` / `hydrate` / `serialize` / `migrate` / `onPaneDeleted`, per-pane monotonic `version`, `expectedVersion` 기반 OCC, 세 가지 `mergeMode` (`merge` / `replace` / `replaceShared`). 31 unit test 가 CRUD + version + mergeMode 트랜잭션 + OCC + 검증 + snapshot + persistence + EventBus emission 을 cover, codex full-stack review 가 catch 한 3건 (`replaceShared` 의 custom 보호, 누적 size cap, `updatedAt` 추가 후 cap 적용) regression test 포함.
+- **`pane.resolveActiveLeaf` IPC 채널 (M0-b)** — caller 가 `paneId` 를 생략하면 main 이 renderer 에 active leaf id 를 query (read-only, paneSlice 쓰기 0) 한 뒤 MetadataStore 에 commit. codex P1 review 가 잡은 split-store read-after-write 구멍 닫힘.
+- **`MetadataStore.snapshot()` ↔ `pane.list` 통합 (M0-c)** — `pane.list` envelope 가 store snapshot 으로 anchored, `asOfSeq` 가 snapshot lineage 를 반영. renderer 가 더 이상 metadata 를 자체 합성하지 않음.
+- **`SessionManager.saveMetadataSync` 와이어 (M0-e)** — MetadataStore 의 persist callback 이 `metadata.json` 에 atomic write, launch 시 store 가 그 파일에서 hydrate. codex P2 review 가 잡은 strict field validation 포함.
+- **Wire format 추가 (M0-f)** — `pane.setMetadata` 가 optional `expectedVersion` + `mergeMode`, reply / event / list 가 optional `version` 필드. v2.x subscriber 영향 없음 (모두 additive).
+- **Optional `version` 필드** on `pane.metadata.changed` events.
+- **PR template** with CHANGELOG + stability-tier sections.
+- **`atomicWriteText` / `atomicReadText`** (sync + async) — `core.ts` 의 JSON 변종과 짝이 되는 텍스트 변종. rotation chain + quarantine 파이프라인 공유. JSON 변종이 parseable payload 를 전제하기 때문에 raw-bytes contract 가 필요한 스크롤백을 위해 sibling 으로 분리.
+- **Cols-collapse corruption detector** (`src/main/scrollback/corruption.ts`) — chopped dump 의 on-disk 시그니처 (median 비공백 행 길이 ≤ 3자, CRLF 바이트 비율 ≥ 0.3) 휴리스틱 검출기. 단일 패스 스캔, allocation 최소. 15 unit test 가 production v2.8.4 fixture (median=1, max=60 까지 outlier 살아남은 chopped 파일) 와 false-positive 저항 (정상 출력, sparse 세션, narrow pane, ANSI-rich 로그, 단일 긴 줄) cover.
+- **`scrollbackDump` util 모듈** (`src/renderer/utils/scrollbackDump.ts`) — renderer 의 dump serializer 를 `AppLayout.tsx` 에서 분리. eligibility 가드 (cols < 12 / rows ≤ 0 / `terminal.element.offsetWidth === 0` / detached) 가 unit-testable. 13 test 가 각 가드 branch + happy path 를 pin.
+- **`scripts/recover-scrollback.mjs` (#35)** — read-only 마이그레이션 CLI. v2.8.x → v2.9.0 첫 부팅에서 `corrupted/` 로 격리된 chopped dump 를 reverse-reflow 로 사람이 읽을 수 있는 텍스트로 복원. `node:util` `parseArgs` 기반, dry-run / verbose / 입출력 dir 오버라이드 지원. 19 unit test (detector parity + 순수 transform + processFile e2e + CLI plumbing). 출력은 별도 폴더로만 쓰고 격리 원본은 절대 수정하지 않음.
+- **`docs/upgrade-v2.9.0.md` (#35)** — v2.8.x → v2.9.0 사용자 마이그레이션 가이드. `corrupted/` 폴더의 의미, 첫 부팅 시 무엇을 보게 되는지, 복원 스크립트 사용법, 복원 한계, 롤백 절차, FAQ.
+
+### Changed
+
+- **README** opening 이 LSP-for-terminals substrate 프레이밍 으로 시작 (AI agent 가치 제안과 tmux 대체 키워드는 보존).
+- **`pane.{set,get,clear}Metadata` 핸들러 (M0-b)** 가 `MetadataStore` 로 라우팅. paneSlice 는 더 이상 RPC metadata path 에 의해 mutate 되지 않음.
+- **paneSlice 가 mirror-only (M0-d)** — 컴파일-타임 write protection 추가. M0-b 가 이미 모든 write path 를 우회시켜 M0-d 는 거의 no-op.
+- **`pane.list` envelope (M0-c)** 가 `MetadataStore.snapshot()` 으로 anchored. snapshot lineage 를 `asOfSeq` 가 반영.
+- **`SessionManager` (M0-e)** 가 `metadata.json` 을 `MetadataStore` persist callback 으로 atomic write, launch 시 store 를 그 파일에서 hydrate.
+- **`SCROLLBACK_DUMP` IPC 핸들러** 가 직접 `writeFileSync` 대신 `atomicWriteTextSync` 사용. rotation chain (.bak / .bak.1 / .bak.2 / .bak.3) 활성화. pre-write corruption 시그니처 검출 시 payload 거부 (defense in depth — renderer 가드 회귀 대비).
+- **`SCROLLBACK_LOAD` IPC 핸들러** 가 `atomicReadTextSync` + validate hook 으로 load. chopped 시그니처 매칭 시 primary 를 `corrupted/{ts}.bak` 으로 격리 후 `.bak` 체인 fallback 으로 시도. 구조화 `CORRUPT_FILE` 로그를 stderr 로 emit. 손상 파일이 fresh xterm 에 복원돼서 다음 5초 dump 가 chopped 상태를 다시 디스크에 쓰는 자기증식 루프를 끊음.
+- **`vitest.config.ts`** 가 `scripts/__tests__/**/*.test.mjs` 도 include — 운영 도구 (마이그레이션 스크립트 등) 가 같은 test runner 아래에서 회귀 보호됨.
+
+### Fixed
+
+- **`replaceShared` mergeMode 가 caller 의 `custom` patch 를 덮어쓰던 결함** (codex full-stack review P2) — `patch.custom` 을 silently ignore 해 tool-namespace clobber 방지. substrate 의 namespace boundary guarantee.
+- **MetadataStore size cap (`PANE_METADATA_MAX_BYTES`) 이 `updatedAt` 추가 전에 검증되던 결함** (codex P2) — 최종 저장 shape (`updatedAt` 포함) 에 대해 검증. boundary 안전.
+- **MetadataStore `custom` entry cap 이 patch 에만 적용되던 결함** (codex P2) — 누적 merge 가 cap 을 우회하지 못하도록 post-merge shape 에 대해 검증.
+- **Split-store read-after-write hole (M0-b codex P1)** — paneId 없이 write 한 뒤 paneId 있는 read 가 stale 을 반환할 수 있던 구멍. 3 개의 metadata 핸들러 모두 `pane.resolveActiveLeaf` 로 통일.
+- **`workspaceId ?? ''` 가 기억된 scope 를 덮어쓰던 결함** (M0-b codex P2) — coercion 제거; MetadataStore 의 기존 fallback 이 정상 동작.
+- **스크롤백 손상 자기증식 루프 (P0 layered defense)** — hidden / zero-width 컨테이너에 대한 `fit()` 이 `cols` 를 ~2 로 collapse 시키면, renderer 의 5초 autosave 가 그 reflowed 버퍼를 캡처해 column-of-chars 로 디스크에 dump. 다음 부팅에 fresh xterm 에 복원되고 또 다시 5초 후에 dump 되며 영구적 손상 루프. 픽스는 네 층: (a) dump-time eligibility 가드 (`cols < 12` / `rows ≤ 0` / `offsetWidth === 0` / detached element), (b) font/theme-change `fit()` 의 visibility 가드 (마지막 unguarded fit 사이트 닫힘), (c) IPC `SCROLLBACK_DUMP` 의 시그니처 거부, (d) IPC `SCROLLBACK_LOAD` 의 시그니처 검출 + 격리 + `.bak` 회전 체인 fallback. 시각 증상은 "재부팅하면 일부 패널 스크롤백이 비어 보임". 자세한 forensic 은 PR #34 참조.
+- **부팅 직후 일부 패널이 input-mute 였던 결함 (reconcile race)** — `daemon.whenReady()` 와 `daemon.onConnected` 가 첫 연결에 같은 reconcile 을 동시에 trigger, 두 walk 가 같은 session 에 대해 race 하면서 한쪽이 ptyId 를 clear. 사용자 증상: 부팅 후 워크스페이스 전환을 한 번 해야 일부 패널이 살아남. 픽스: `reconcileInFlightRef` 가 중복 trigger 를 drop, workspace snapshot 을 walk 마다 다시 읽어 동시 spawn 이 frozen view 에 가려지지 않음.
+- **`pty:resize` 가 recovery PTY mute race 를 유발하던 결함** — daemon 이 아직 session 을 publish 하기 전에 renderer 가 보낸 `pty:resize` 가 "session not found" 로 실패하고 recovery PTY 가 muted 상태로 남던 결함. 50 × 20ms retry budget + 진단 로그 추가.
+- **IPC `session` + `scrollback` 핸들러가 daemon-connect handler-swap cycle 의 unregister 윈도우에 떨어지던 결함** — cold boot 시 `scrollback:load` 가 "No handler registered" 로 거부되고 다음 5초 autosave 가 빈 버퍼를 디스크에 덮어쓰던 결함. session + scrollback 핸들러를 swap cycle 밖으로 이동.
+- **logSink 의 EPIPE 무한 루프** — stdout 이 닫힌 상태에서 console.error 가 logSink 를 호출하고 logSink 가 다시 console.error 를 호출하던 reentrancy 루프. reentrancy 가드 + `orig()` try/catch 추가. `appendFileSync` 사용으로 로그가 디스크에 durable.
+
+### Migration Notes
+
+- **자동 마이그레이션**. 사용자 액션 불필요한 부분: substrate wire 변경 (모두 additive optional), MetadataStore 통합 (paneSlice consumer 영향 없음), atomic write + .bak rotation (v2.7.x 부터 이미 다른 파일에 적용된 패턴).
+- **v2.8.x 의 chopped 스크롤백**: 첫 부팅에서 자동 격리된다. **데이터를 v2.9.0 이 버린 게 아니라 v2.8.x 시점에 이미 chopped 형태로 저장돼 있던 것을 v2.9.0 이 검출만 한 것**. 사람이 읽을 수 있는 텍스트로의 회수는 `node scripts/recover-scrollback.mjs --verbose` 로 가능 (자세한 가이드는 `docs/upgrade-v2.9.0.md`).
+- **`corrupted/` 폴더**: 30 일 / 폴더당 10 파일까지 자동 정리. 수동 삭제도 안전.
+- **`pane.metadata.changed` event subscriber**: optional `version` 필드가 추가됐다. 무시해도 v2.x 와 동일 동작.
+
 ## [2.8.4] — 2026-05-12 — Agent Notification Pipeline Restoration
 
 사용자가 보고한 "Claude 가 작업을 끝내도 사이드바 dot, unread 배지, OS 토스트 — 3가지 신호 전부 안 뜬다" 결함을 root-cause 수준에서 복구. main 의 감지 레이어 (PTYBridge, AgentDetector, ActivityMonitor) 가 emit 하는 신호를 renderer UI 까지 연결하는 wiring 이 4 군데 끊겨 있었고, **wmux production 인 daemon mode 에서는 PTYBridge 가 아예 우회되어 본 fix 가 0 효과** 라는 더 큰 결함도 포함. 메인은 PR #30 (4 commits, +1579/-141, 29 files) 이고, 같은 릴리즈에 두 개의 다른 PR — **#28 (@dev-minggyu, workspace drag reorder 복구 — 외부 기여 첫 컨트리뷰션)** 과 **#29 (multiview sticky group + MiniSidebar feature parity)** — 도 함께 ship 됐다.
