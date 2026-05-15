@@ -10,7 +10,8 @@
 
 **Keywords:** Windows tmux, tmux for Windows, terminal multiplexer Windows, AI agent terminal, Claude Code Windows, Codex CLI, Gemini CLI, MCP server, Chrome DevTools Protocol, split terminal, multi-agent terminal, browser automation, ConPTY, xterm.js, Electron terminal.
 
----
+---<img width="1578" height="782" alt="1" src="https://github.com/user-attachments/assets/3a75969a-d383-418e-96aa-d3f108c87e9a" />
+
 
 ## Still running one terminal for your AI coding agents on Windows?
 
