@@ -9,6 +9,8 @@ import { StateWriter } from './StateWriter';
 import { ProcessMonitor } from './ProcessMonitor';
 import { Watchdog } from './Watchdog';
 import { selectRecoverableSessions } from './recoverySelector';
+import { createSnapshotRunner } from './snapshotRunner';
+import { RingBuffer } from './RingBuffer';
 import type { DaemonState } from './types';
 import type { DaemonEvent, DaemonCreateSessionParams, DaemonSessionIdParams, DaemonResizeParams } from '../shared/rpc';
 
@@ -469,6 +471,7 @@ function registerRpcHandlers(
   startTime: number,
   sessionDataListeners: Map<string, { bridge: import('./DaemonPTYBridge').DaemonPTYBridge; listener: (data: Buffer) => void }>,
   watchdog: Watchdog,
+  triggerSnapshot: () => void,
 ): void {
   // daemon.createSession
   pipeServer.onRpc('daemon.createSession', async (params) => {
@@ -503,6 +506,11 @@ function registerRpcHandlers(
     // Save state immediately
     const state = buildState(sessionManager);
     stateWriter.saveImmediate(state);
+
+    // A1b — fire the snapshot runner so the new session has a .buf on disk
+    // before the next 30 s tick. Crashes within that window now keep a
+    // recoverable trace instead of losing the brand-new pane entirely.
+    triggerSnapshot();
 
     return session;
   });
@@ -590,6 +598,10 @@ function registerRpcHandlers(
 
     const state = buildState(sessionManager);
     stateWriter.saveImmediate(state);
+
+    // A1b — fire the snapshot runner after attach so a freshly-attached
+    // recovered session has its .buf refreshed inside the first 30 s window.
+    triggerSnapshot();
 
     return { ok: true };
   });
@@ -689,11 +701,30 @@ function registerRpcHandlers(
     return { status: 'ok', uptime, sessions: sessions.length };
   });
 
-  // daemon.shutdown — gracefully terminate the daemon process
+  // daemon.shutdown — gracefully terminate the daemon process. A2 makes
+  // this RPC awaitable: the handler runs the full shutdown body (dumps,
+  // state save, dispose) before returning, then defers the pipe stop and
+  // process.exit to setImmediate so the RPC ack actually flushes back to
+  // the caller. Callers (e.g., main before-quit / WM_ENDSESSION) can
+  // await this with a per-call timeoutMs override (DaemonClient.rpc opt).
   pipeServer.onRpc('daemon.shutdown', async () => {
     log('info', 'Shutdown requested via RPC');
-    // Respond first, then initiate shutdown on next tick
-    setImmediate(() => process.emit('SIGTERM' as any));
+    await shutdown(
+      'rpc.shutdown',
+      sessionManager,
+      pipeServer,
+      stateWriter,
+      sessionPipes,
+      processMonitor,
+      watchdog,
+      { skipPipeStop: true, skipExit: true },
+    );
+    // ack flushes after this return; then the pipe + process tear down.
+    setImmediate(() => {
+      void pipeServer.stop().catch(() => { /* best effort */ }).finally(() => {
+        process.exit(0);
+      });
+    });
     return { status: 'ok' };
   });
 }
@@ -859,9 +890,20 @@ function buildState(sessionManager: DaemonSessionManager): DaemonState {
   };
 }
 
+// Phase A — A1b snapshot runner lives in ./snapshotRunner so the unit tests
+// can import it without triggering main() at the bottom of this file.
+
 // === Graceful shutdown ===
 
 let shuttingDown = false;
+// Phase A — A4. Flipped to true once the async shutdown body has resolved
+// every Promise from ringBuffer.dumpToFile(). The Windows process.on('exit')
+// sync fallback consults this flag: if dumps already completed it skips
+// (avoiding duplicate writes), otherwise it runs dumpToFileSyncAtomic for
+// every live session as a last-resort save. Replaces a broader
+// `if (shuttingDown) return` guard that would have skipped the sync save
+// even when the async path was interrupted mid-dump.
+let dumpsCompleted = false;
 
 async function shutdown(
   signal: string,
@@ -871,6 +913,7 @@ async function shutdown(
   sessionPipes: Map<string, SessionPipe>,
   processMonitor: ProcessMonitor,
   watchdog: Watchdog,
+  opts: { skipPipeStop?: boolean; skipExit?: boolean } = {},
 ): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -918,6 +961,8 @@ async function shutdown(
     );
   }
   await Promise.all(dumpPromises);
+  // A4 — async dumps are durable. Sync exit handler will short-circuit.
+  dumpsCompleted = true;
 
   // Save suspended state BEFORE disposing
   if (!cachedBootId) cachedBootId = await getBootId();
@@ -933,11 +978,25 @@ async function shutdown(
 
   stateWriter.dispose();
 
-  // Stop IPC server
-  await pipeServer.stop().catch(() => {});
+  // Stop IPC server — skipped when the caller (e.g., daemon.shutdown RPC)
+  // still needs the pipe to flush its ack.
+  if (!opts.skipPipeStop) {
+    await pipeServer.stop().catch(() => {});
+  }
 
   releaseLock();
   log('info', 'Daemon stopped');
+
+  // Clear the hard-timeout guard now that shutdown has reached its end.
+  // Without this, the timer would still fire after a skipExit deferral if
+  // the macrotask was delayed under load.
+  clearTimeout(shutdownTimeout);
+
+  if (opts.skipExit) {
+    // Caller (RPC handler) will fire setImmediate(() => process.exit(0))
+    // after returning so the ack flushes back to the client first.
+    return;
+  }
   process.exit(0);
 }
 
@@ -961,6 +1020,14 @@ async function main(): Promise<void> {
 
   // 3. Initialize modules
   const stateWriter = new StateWriter(wmuxDir);
+  // A4 — sweep tmp dumps left behind by a previous crash. They are safe to
+  // delete: tmp files only exist between the write and rename steps of an
+  // atomic dump, so any tmp on disk now is from a daemon that died before
+  // the rename completed. The .buf at the same path is either intact (old
+  // good dump) or absent (first dump never finished, scrollback lost for
+  // that session, which we cannot recover anyway).
+  RingBuffer.cleanupStaleTmpFiles(stateWriter.getBufferDir());
+
   const sessionManager = new DaemonSessionManager();
   sessionManager.setConfig(config);
   const pipeServer = new DaemonPipeServer(config.daemon.pipeName);
@@ -969,11 +1036,28 @@ async function main(): Promise<void> {
   const sessionPipes = new Map<string, SessionPipe>();
   const sessionDataListeners = new Map<string, { bridge: import('./DaemonPTYBridge').DaemonPTYBridge; listener: (data: Buffer) => void }>();
 
+  // Forward reference — initialised at step 8c after the snapshot runner is
+  // wired. RPC handlers that fire before initialisation simply skip the
+  // immediate snapshot; the 30 s interval will still cover them.
+  let runSnapshotOnceRef: (() => Promise<void>) | null = null;
+
   // 4. Recover previous sessions
   await recoverSessions(stateWriter, sessionManager, processMonitor);
 
   // 5. Register RPC handlers
-  registerRpcHandlers(pipeServer, sessionManager, stateWriter, sessionPipes, processMonitor, startTime, sessionDataListeners, watchdog);
+  registerRpcHandlers(
+    pipeServer,
+    sessionManager,
+    stateWriter,
+    sessionPipes,
+    processMonitor,
+    startTime,
+    sessionDataListeners,
+    watchdog,
+    () => {
+      if (runSnapshotOnceRef) void runSnapshotOnceRef();
+    },
+  );
 
   // 6. Wire events
   wireEvents(sessionManager, pipeServer, stateWriter, sessionPipes, processMonitor, sessionDataListeners);
@@ -1045,37 +1129,23 @@ async function main(): Promise<void> {
   // 8c. Periodic buffer snapshots (every 30s) — survives forced kills / power loss
   // Also save sessions.json so recovery has up-to-date session metadata.
   // Sequential dumps to avoid simultaneous memory peaks from all buffers at once.
-  let snapshotRunning = false;
+  // The runner is also invoked once immediately below (A1b) to close the
+  // 30 s window where no .buf exists yet on disk.
+  const runSnapshotOnce = createSnapshotRunner(sessionManager, stateWriter, {
+    getBootId: () => {
+      if (!cachedBootId) cachedBootId = getBootIdSync();
+      return cachedBootId;
+    },
+  });
+  runSnapshotOnceRef = runSnapshotOnce;
   const snapshotInterval = setInterval(() => {
-    if (snapshotRunning) return; // skip if previous snapshot cycle still in progress
-    const managed = sessionManager.listManagedSessions();
-    const live = managed.filter((m) => m.meta.state !== 'dead');
-    if (live.length === 0) return;
-
-    snapshotRunning = true;
-    stateWriter.ensureBufferDir();
-
-    (async () => {
-      for (const m of live) {
-        const dumpPath = stateWriter.getBufferDumpPath(m.meta.id);
-        try {
-          await m.ringBuffer.dumpToFile(dumpPath);
-        } catch (err) {
-          log('warn', `Snapshot dump failed for ${m.meta.id}:`, err);
-        }
-      }
-      // Save session metadata after all buffer dumps complete
-      try {
-        const state = buildState(sessionManager);
-        stateWriter.saveImmediate(state);
-      } catch (err) {
-        log('warn', 'Snapshot state save failed:', err);
-      }
-    })().finally(() => {
-      snapshotRunning = false;
-    });
+    void runSnapshotOnce();
   }, 30_000);
   snapshotInterval.unref();
+
+  // A1b — fire an initial snapshot at spawn so a crash within the first
+  // 30 s leaves a recoverable .buf trace rather than nothing.
+  void runSnapshotOnce();
 
   // 9. Signal handlers
   const doShutdown = (sig: string) =>
@@ -1090,7 +1160,12 @@ async function main(): Promise<void> {
   // synchronous save, and also periodic state saves to minimize data loss.
   if (process.platform === 'win32') {
     process.on('exit', () => {
-      // Synchronous-only — dump what we can before process dies
+      // Phase A — A4. Precise guard: skip the sync save only if the async
+      // shutdown body actually finished its dumps. If the async path was
+      // interrupted mid-dump (process about to die), fall through and run
+      // the sync atomic save as a last-resort.
+      if (dumpsCompleted) return;
+      // Synchronous-only — dump what we can before process dies.
       try {
         const managed = sessionManager.listManagedSessions();
         stateWriter.ensureBufferDir();
@@ -1098,8 +1173,11 @@ async function main(): Promise<void> {
           if (m.meta.state === 'dead') continue;
           const dumpPath = stateWriter.getBufferDumpPath(m.meta.id);
           try {
-            const data = m.ringBuffer.readAll();
-            fs.writeFileSync(dumpPath, data);
+            // A4 — atomic sync write: tmp + renameSync so a reader can
+            // never observe a half-written .buf, even if the OS pulls the
+            // plug mid-write. Replaces the bare writeFileSync that left a
+            // partial file behind on power loss.
+            m.ringBuffer.dumpToFileSyncAtomic(dumpPath);
             m.meta.state = 'suspended';
             m.meta.bufferDumpPath = dumpPath;
           } catch { /* best effort */ }

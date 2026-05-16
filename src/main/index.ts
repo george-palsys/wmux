@@ -30,6 +30,8 @@ import { AutoUpdater } from './updater/AutoUpdater';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
 import { DaemonClient, getDaemonPipeName, readDaemonAuthToken } from './DaemonClient';
+import { raceDaemonShutdown } from './daemonShutdownRace';
+import { migrateScrollbackOnce } from './scrollback/legacyMigration';
 import { DaemonNotificationRouter } from './notification/DaemonNotificationRouter';
 import { ensureDaemon } from './daemon/launcher';
 import { createTray, destroyTray } from './tray';
@@ -236,7 +238,12 @@ const mcpHandlerOptions = {
 // on cold boot, which silently destroyed previous-session scrollback when
 // the post-restore 5s autosave dumped the empty/fresh buffer over it.
 // Same hardening pattern as the v2.8.1 Bug 3 fix for `daemon:get-ready-state`.
-registerSessionHandlers();
+// Phase A — A6. Pass a live getter for the daemon-connected state so the
+// scrollback:dump + scrollback:load handlers short-circuit while a daemon
+// is healthy. The getter closes over the `daemonClient` let above, so the
+// handlers see every connect/disconnect transition that mutates that
+// variable (no closure snapshot).
+registerSessionHandlers(() => daemonClient?.isConnected === true);
 
 let cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, mcpHandlerOptions);
 
@@ -381,8 +388,13 @@ app.on('ready', async () => {
     }
   });
 
-  // System tray — lets the app stay alive when window is closed
-  createTray(mainWindow, () => { isQuitting = true; });
+  // System tray — lets the app stay alive when window is closed.
+  // Phase A — A3/A5 fix (codex review P1, session 019e2af8): the callback
+  // used to set isQuitting=true before tray.ts then called app.quit(). The
+  // resulting before-quit handler hit `if (isQuitting) return` on its first
+  // pass and skipped the entire daemon.shutdown race added in A3. Now the
+  // callback is a no-op; before-quit's first pass sets isQuitting itself.
+  createTray(mainWindow, () => { /* no-op — before-quit handles isQuitting */ });
 
   // Auto-start daemon and connect
   try {
@@ -425,11 +437,35 @@ app.on('ready', async () => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('daemon:connected');
         }
+        // Phase A — A7. Run the one-time legacy scrollback migration on
+        // the first daemon-healthy transition. Best-effort: if rename
+        // fails (EBUSY/EPERM under antivirus) the runner returns
+        // retry-needed and the next transition tries again. Log the
+        // breadcrumb either way so the user can spot a stuck migration
+        // in the main-side log.
+        try {
+          const result = migrateScrollbackOnce(app.getPath('userData'), app.getVersion());
+          if (result.status === 'migrated') {
+            console.log(`[Main] A7 scrollback legacy migration → ${result.legacyDir}`);
+          } else if (result.status === 'retry-needed') {
+            console.warn(`[Main] A7 scrollback migration retry-needed: ${result.error}`);
+          }
+        } catch (err) {
+          console.warn('[Main] A7 scrollback migration threw:', err);
+        }
         daemonClient.on('disconnected', () => {
           console.warn('[Main] Daemon disconnected, falling back to local PTY');
           daemonNotificationRouter?.stop();
           daemonNotificationRouter = null;
           daemonClient = null;
+          // Phase A — A6. Notify the renderer so the daemon-mode .txt
+          // write/load gates open again (local mode preserves the
+          // pre-existing scrollback path). Without this, the renderer
+          // would still treat itself as daemon-connected and skip the
+          // .txt autosave even though no daemon is replaying PTY data.
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('daemon:disconnected');
+          }
           logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup begin');
           cleanupHandlers();
           logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup done, register begin');
@@ -647,8 +683,26 @@ app.on('before-quit', async (e) => {
   disposeFirstRunHandlers();
 
   if (daemonClient?.isConnected) {
-    // Daemon mode: detach only — sessions persist in daemon
-    console.log('[Main] Daemon mode — detaching sessions (not killing)');
+    // Daemon mode. Phase A — A3: race daemon.shutdown against a calibrated
+    // budget so the daemon can flush RingBuffers atomically before we
+    // detach. The 4 s placeholder is the documented floor pending the T5
+    // dynamic test (Task #15) measurement.
+    const BEFORE_QUIT_TIMEOUT_MS = 4_000;
+    console.log(
+      `[Main] Daemon mode — racing daemon.shutdown (${BEFORE_QUIT_TIMEOUT_MS}ms budget)`,
+    );
+    const race = await raceDaemonShutdown(daemonClient, BEFORE_QUIT_TIMEOUT_MS);
+    if (race.ok) {
+      console.log('[Main] daemon.shutdown ack received');
+    } else {
+      console.warn(
+        `[Main] daemon.shutdown did not complete in time, falling back to detach: ${race.error}`,
+      );
+    }
+    // Always detach as the final step. If the RPC succeeded the pipe is
+    // already torn down on the daemon side; disconnect cleans up our half.
+    // If it failed (timeout / dead daemon), disconnect is the original
+    // fallback path that was in place before A3 landed.
     await daemonClient.disconnect();
     daemonClient = null;
   } else {
@@ -671,8 +725,8 @@ app.on('before-quit', async (e) => {
 // signal before Windows force-kills the process. The 'before-quit' async
 // handler may not complete in time, so we do a synchronous emergency save here.
 if (process.platform === 'win32') {
-  app.on('session-end' as any, () => {
-    console.log('[Main] session-end received — emergency sync save');
+  app.on('session-end' as any, async () => {
+    console.log('[Main] session-end received — emergency sync save + daemon race');
     try {
       // Import SessionManager lazily to avoid circular deps
       const { SessionManager } = require('./session/SessionManager');
@@ -685,8 +739,23 @@ if (process.platform === 'win32') {
       console.error('[Main] Emergency session save failed:', err);
     }
 
-    // Detach daemon synchronously — don't kill sessions
     if (daemonClient?.isConnected) {
+      // Phase A — A5. Race daemon.shutdown against the WM_ENDSESSION budget
+      // (~5 s before Windows SIGKILLs us) so the daemon can complete its
+      // atomic RingBuffer dumps before we tear down the pipe. Leave a 1 s
+      // safety margin for disconnectSync + Electron's own teardown.
+      //
+      // 4 s is the documented floor pending the T5 dynamic test
+      // measurement (Task #15). The harness exists at
+      // scripts/daemon-shutdown-dynamic.mjs; rerun on the target box and
+      // adjust if measured p99 latency calls for a smaller value.
+      const A5_TIMEOUT_MS = 4_000;
+      const race = await raceDaemonShutdown(daemonClient, A5_TIMEOUT_MS);
+      if (!race.ok) {
+        console.warn(
+          `[Main] session-end daemon.shutdown race failed (${A5_TIMEOUT_MS} ms): ${race.error}`,
+        );
+      }
       try {
         daemonClient.disconnectSync();
       } catch {
