@@ -1,4 +1,7 @@
 export const ja = {
+  // App lifecycle
+  'app.restoringPanes': 'パネルを復元中…',
+
   // Sidebar
   'sidebar.workspaces': 'ワークスペース',
   'sidebar.newWorkspace': '新しいワークスペース',
@@ -125,6 +128,8 @@ export const ja = {
   'settings.defaultShell': 'デフォルトシェル',
   'settings.scrollbackLines': 'スクロールバック行数',
   'settings.scrollbackDesc': 'ターミナルバッファに保持する行数',
+  'settings.scrollbackRestore': '起動時に復元',
+  'settings.scrollbackRestoreDesc': '再起動後に前のセッション出力を再接続。オフにすると毎回すべてのペインが新規状態で起動。',
   'settings.updates': 'アップデート',
   'settings.wmuxUpdates': 'wmux アップデート',
   'settings.updateFailed': 'アップデート確認に失敗しました',

@@ -1,4 +1,7 @@
 export const zh = {
+  // App lifecycle
+  'app.restoringPanes': '正在恢复面板…',
+
   // Sidebar
   'sidebar.workspaces': '工作区',
   'sidebar.newWorkspace': '新建工作区',
@@ -125,6 +128,8 @@ export const zh = {
   'settings.defaultShell': '默认 Shell',
   'settings.scrollbackLines': '回滚行数',
   'settings.scrollbackDesc': '终端缓冲区保留行数',
+  'settings.scrollbackRestore': '启动时恢复',
+  'settings.scrollbackRestoreDesc': '重启后重新连接到上次会话输出。关闭则每次启动所有面板都从空白开始。',
   'settings.updates': '更新',
   'settings.wmuxUpdates': 'wmux 更新',
   'settings.updateFailed': '检查更新失败',

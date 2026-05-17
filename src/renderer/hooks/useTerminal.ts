@@ -146,6 +146,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const container = containerRef.current;
     if (!container || !ptyId) return;
 
+    const daemonModeAtMount = isDaemonModeActive();
+
     const terminal = new Terminal({
       cursorBlink: true,
       fontSize: terminalFontSize,
@@ -517,6 +519,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // fresh xterm with no stale prefix.
     let didRestoreTxt = false;
     let removeDaemonConnectedForRestore: (() => void) | null = null;
+    // Flush-marker reset gating (see docs/internal/scrollback-restore-design.md).
+    // The previous unconditional `terminal.reset()` on `daemon.onConnected`
+    // wiped the .txt-cache replay even when the daemon then sent zero bytes
+    // (cap-skipped session or fresh create). Two flags coordinate the new
+    // gate: `pendingFlushReset` means "daemon connected after .txt was
+    // restored — we owe a verdict once flush bytes are known";
+    // `lastFlushRecoveredBytes` caches the verdict for the inverse race
+    // (flush arrives before daemon.onConnected fires).
+    let pendingFlushReset = false;
+    let lastFlushRecoveredBytes: number | null = null;
+    let removeFlushListener: (() => void) | null = null;
     let firstDataFired = false;
     const fireFirstData = () => {
       if (!firstDataFired) {
@@ -567,6 +580,50 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
       });
 
+      // Listen for the daemon's flush-complete signal. Two-way race:
+      //  - Flush arrives first: cache `recoveredBytes`; the
+      //    `daemon.onConnected` callback below reads it when it fires.
+      //  - Flush arrives second: the callback set `pendingFlushReset=true`;
+      //    we apply the verdict now.
+      removeFlushListener = window.electronAPI.pty.onFlushComplete((id, recoveredBytes) => {
+        if (id !== ptyId) return;
+        if (terminalRef.current !== terminal) return;
+        lastFlushRecoveredBytes = recoveredBytes;
+        if (pendingFlushReset) {
+          pendingFlushReset = false;
+          if (recoveredBytes > 0) terminal.reset();
+        }
+      });
+
+      // Fix 0 (round 3) — trigger pty.reconnect ourselves now that all
+      // listeners (pty.onData, pty.onFlushComplete, pty.onExit) are wired.
+      // AppLayout.reconcile used to call pty.reconnect, but that fired
+      // SessionPipe replay BEFORE Terminal mount → ipcRenderer.on(PTY_DATA)
+      // had no listener → every replay chunk dropped. Calling reconnect
+      // here guarantees the replay arrives on registered listeners.
+      // No-op cost when the session is already connected (daemonClient
+      // honors forceFresh=true). For freshly Terminal.tsx-self-created
+      // ptyIds, the daemon-side ringBuffer is essentially empty, so a
+      // re-attach replays at most the shell prompt — visible cost zero.
+      if (daemonModeAtMount) {
+        void window.electronAPI.pty.reconnect(ptyId).then((result) => {
+          // Codex P1 — pty.reconnect resolves with { success: false } when
+          // the session died between AppLayout's liveness check and our
+          // mount call. Without this branch the Terminal would keep the
+          // stale ptyId and silently never get input forwarded —
+          // reproducing the exact input-mute class Fix 0 set out to
+          // eliminate. Clear the surface ptyId so the next mount falls
+          // into Terminal.tsx's self-create path.
+          if (!result?.success) {
+            console.warn(`[useTerminal] pty.reconnect rejected ${ptyId}: ${result?.error ?? '<no error>'}`);
+            useStore.getState().clearSurfacePtyIdByPty(ptyId);
+          }
+        }).catch((err: unknown) => {
+          console.warn(`[useTerminal] pty.reconnect threw for ${ptyId}: ${err instanceof Error ? err.message : String(err)}`);
+          useStore.getState().clearSurfacePtyIdByPty(ptyId);
+        });
+      }
+
       window.electronAPI.scrollback.load(scrollbackFile).then((content) => {
         // Skip the entire branch if the terminal was disposed during the
         // async IPC round-trip. Without this, the pendingData flush below
@@ -594,13 +651,25 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           fireFirstData();
           didRestoreTxt = true;
           // Arm the late-connect clear. If daemon mode activates after this
-          // moment, wipe the terminal so the SessionPipe replay does not
-          // compose on top of the stale .txt content we just wrote.
+          // moment, the reset only fires when the daemon actually has
+          // authoritative scrollback to replay (recoveredBytes > 0).
+          // Two race outcomes are handled:
+          //   1. Flush already arrived (lastFlushRecoveredBytes != null):
+          //      apply its verdict immediately.
+          //   2. Flush hasn't arrived: set pendingFlushReset so the
+          //      flush-complete listener applies the verdict later.
+          // recoveredBytes=0 (cap-skipped session or fresh create) leaves
+          // the .txt cache on screen — degraded gracefully instead of
+          // wiping to a blank prompt.
           removeDaemonConnectedForRestore = window.electronAPI.daemon.onConnected(() => {
             if (!didRestoreTxt) return;
             if (terminalRef.current !== terminal) return;
-            terminal.reset();
             didRestoreTxt = false;
+            if (lastFlushRecoveredBytes !== null) {
+              if (lastFlushRecoveredBytes > 0) terminal.reset();
+            } else {
+              pendingFlushReset = true;
+            }
           });
         }
         scrollbackLoaded = true;
@@ -641,6 +710,26 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       connectPty();
       // No scrollback to restore — register immediately for fresh terminals.
       terminalRegistry.set(ptyId, terminal);
+      // Fix 0 (round 3) — trigger pty.reconnect after listener is wired.
+      // See the scrollback branch above for the full rationale.
+      if (daemonModeAtMount) {
+        void window.electronAPI.pty.reconnect(ptyId).then((result) => {
+          // Codex P1 — pty.reconnect resolves with { success: false } when
+          // the session died between AppLayout's liveness check and our
+          // mount call. Without this branch the Terminal would keep the
+          // stale ptyId and silently never get input forwarded —
+          // reproducing the exact input-mute class Fix 0 set out to
+          // eliminate. Clear the surface ptyId so the next mount falls
+          // into Terminal.tsx's self-create path.
+          if (!result?.success) {
+            console.warn(`[useTerminal] pty.reconnect rejected ${ptyId}: ${result?.error ?? '<no error>'}`);
+            useStore.getState().clearSurfacePtyIdByPty(ptyId);
+          }
+        }).catch((err: unknown) => {
+          console.warn(`[useTerminal] pty.reconnect threw for ${ptyId}: ${err instanceof Error ? err.message : String(err)}`);
+          useStore.getState().clearSurfacePtyIdByPty(ptyId);
+        });
+      }
     }
 
     // Resize PTY on initial fit — only when we actually have valid dimensions.
@@ -721,6 +810,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       removeDataListener?.();
       removeExitListener?.();
       removeDaemonConnectedForRestore?.();
+      removeFlushListener?.();
       terminalRegistry.delete(ptyId);
       webglAddonRef.current?.dispose();
       webglAddonRef.current = null;

@@ -18,6 +18,15 @@ import {
 import { applyCustomCssVars, clearCustomCssVars, DEFAULT_CUSTOM_THEME } from '../../themes';
 
 export interface UISlice {
+  // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
+  // Lifecycle marker promoted from local AppLayout state so RPC handlers
+  // (useRpcBridge, companyRpcHandlers) can cheaply guard against stale
+  // ptyId writes during the startup reconcile window. Flips from
+  // 'pending' to 'ready' exactly once per renderer lifetime, in
+  // AppLayout's mount effect finally block.
+  paneGate: 'pending' | 'ready';
+  setPaneGate: (state: 'pending' | 'ready') => void;
+
   sidebarVisible: boolean;
   toggleSidebar: () => void;
   setSidebarVisible: (visible: boolean) => void;
@@ -60,6 +69,16 @@ export interface UISlice {
 
   scrollbackLines: number;
   setScrollbackLines: (lines: number) => void;
+
+  // Fix 0 — user-facing toggle for scrollback restore behavior.
+  // true (default): startup reconciles + reconnects to daemon SessionPipes
+  //   so prior session output is restored on every launch.
+  // false: startup calls clearAllPtyState and every Terminal mounts fresh.
+  //   The daemon still dumps ringBuffers on graceful Quit (no extra RPC to
+  //   suppress it), but the renderer never reads them — orphan .buf files
+  //   are reaped by cleanOrphanedBuffers on the next launch.
+  scrollbackRestoreEnabled: boolean;
+  setScrollbackRestoreEnabled: (enabled: boolean) => void;
 
   // ─── Theme ──────────────────────────────────────────────────────────────
   theme: string;
@@ -205,6 +224,13 @@ function collectFirstLeafId(pane: Pane): string {
 }
 
 export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]], [], UISlice> = (set, get) => ({
+  // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
+  paneGate: 'pending',
+
+  setPaneGate: (gate) => set((state) => {
+    state.paneGate = gate;
+  }),
+
   // ─── Sidebar ─────────────────────────────────────────────────────────────
   sidebarVisible: true,
 
@@ -324,6 +350,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setScrollbackLines: (lines) => set((state) => {
     state.scrollbackLines = lines;
+  }),
+
+  scrollbackRestoreEnabled: true,
+
+  setScrollbackRestoreEnabled: (enabled) => set((state) => {
+    state.scrollbackRestoreEnabled = enabled;
   }),
 
   // ─── Theme ──────────────────────────────────────────────────────────────
