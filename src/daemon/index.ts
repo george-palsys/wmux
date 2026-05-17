@@ -305,25 +305,76 @@ async function recoverSessions(
         if (fs.existsSync(session.bufferDumpPath)) {
           scrollbackData = fs.readFileSync(session.bufferDumpPath);
         }
+        // Instrumentation for #35 (scrollback-empty-after-restart). The
+        // matching `Suspended session X (buffer: N bytes)` line on the
+        // shutdown side already proves what we dumped; this line proves
+        // what we found on the next boot. If they match, the dump/restore
+        // file path is intact and a downstream layer (RingBuffer write,
+        // SessionPipe flush, renderer) is at fault. If the bytes drop
+        // here, the dump file itself was empty or missing.
+        log(
+          'info',
+          `[recovery] session ${session.id} dump=${session.bufferDumpPath} exists=${scrollbackData !== undefined} bytes=${scrollbackData?.length ?? 0}`,
+        );
 
         // Verify cwd still exists; fall back to homedir
         const cwd = fs.existsSync(session.cwd) ? session.cwd : os.homedir();
 
-        const recovered = sessionManager.createSession({
-          id: session.id,
-          cmd: session.cmd,
-          cwd,
-          env: session.env,
-          cols: session.cols,
-          rows: session.rows,
-          agent: session.agent,
-          createdAt: session.createdAt,
-          scrollbackData,
-          // v2.8.1: stay muted until the renderer's first resize so PTY
-          // output produced at the saved geometry can't interleave with
-          // the renderer paint at its current geometry (Bug 2).
-          deferOutput: true,
-        });
+        // ConPTY on Windows occasionally rejects the first spawn after a
+        // daemon restart with ERROR_INVALID_PARAMETER (87) — a known
+        // transient race in the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE init.
+        // Without retry, a single transient failure permanently dead-marks
+        // the session and the user loses their scrollback for good. The
+        // RPC-level retry in scripts/instrumentation-verify.mjs (Flow 1)
+        // is the same pattern; mirror it here for recovery.
+        // Other errors (e.g. ENOENT cwd, MAX_SESSIONS) are not transient
+        // and fall through to the outer catch immediately.
+        // Retry budget sized to absorb the worst observed ConPTY ERROR 87
+        // burst (4 consecutive failures in dynamic verify on a busy box).
+        // 8 attempts × (200 + i*100) ms backoff = up to ~4.4 s waiting
+        // before giving up. Recovery runs once per daemon boot, so the
+        // worst-case latency hit is only paid by users actually hitting
+        // the burst — the happy path still resolves on attempt 1.
+        const RECOVERY_PTY_RETRIES = 8;
+        let recovered: ReturnType<typeof sessionManager.createSession> | undefined;
+        let lastSpawnErr: unknown;
+        for (let attempt = 1; attempt <= RECOVERY_PTY_RETRIES; attempt++) {
+          try {
+            recovered = sessionManager.createSession({
+              id: session.id,
+              cmd: session.cmd,
+              cwd,
+              env: session.env,
+              cols: session.cols,
+              rows: session.rows,
+              agent: session.agent,
+              createdAt: session.createdAt,
+              scrollbackData,
+              // v2.8.1: stay muted until the renderer's first resize so PTY
+              // output produced at the saved geometry can't interleave with
+              // the renderer paint at its current geometry (Bug 2).
+              deferOutput: true,
+            });
+            break;
+          } catch (err) {
+            lastSpawnErr = err;
+            const msg = err instanceof Error ? err.message : String(err);
+            const transient = msg.includes('error code: 87');
+            if (!transient) break;
+            log(
+              'warn',
+              `Recovery PTY spawn attempt ${attempt}/${RECOVERY_PTY_RETRIES} failed for ${session.id}: ${msg}`,
+            );
+            if (attempt < RECOVERY_PTY_RETRIES) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, 200 + attempt * 100),
+              );
+            }
+          }
+        }
+        if (!recovered) {
+          throw lastSpawnErr ?? new Error('PTY spawn failed (no error captured)');
+        }
 
         // Start process monitoring for the new PTY
         processMonitor.watch(recovered.id, recovered.pid, () => {
@@ -927,6 +978,21 @@ async function shutdown(
   }, 10_000);
   shutdownTimeout.unref();
 
+  // Phase-level latency instrumentation. The 4 s race budget on the main
+  // side (BEFORE_QUIT_TIMEOUT_MS) is regularly exceeded on a 48-PTY daemon
+  // (user dogfood 2026-05-16/17). Without per-phase timing we can only
+  // guess at which step dominates: pipe drain, buffer dump fanout,
+  // state save, or serial PTY kill. These logs make the budget call
+  // empirical instead of a guess.
+  const shutdownStartedAt = Date.now();
+  const phaseStartedAt = (): number => Date.now();
+  const phaseLog = (name: string, startedAt: number, extra?: Record<string, unknown>): void => {
+    const elapsedMs = Date.now() - startedAt;
+    const totalMs = Date.now() - shutdownStartedAt;
+    const extraStr = extra ? ' ' + JSON.stringify(extra) : '';
+    log('info', `[shutdown.phase] ${name} elapsed=${elapsedMs}ms total=${totalMs}ms${extraStr}`);
+  };
+
   // Stop watchdog
   watchdog.stop();
 
@@ -934,16 +1000,19 @@ async function shutdown(
   processMonitor.unwatchAll();
 
   // Clean up all session pipes
+  const pipeStopsStart = phaseStartedAt();
   const pipeStops = Array.from(sessionPipes.values()).map((pipe) =>
     pipe.stop().catch(() => {}),
   );
   await Promise.all(pipeStops);
   sessionPipes.clear();
+  phaseLog('pipeStops', pipeStopsStart, { count: pipeStops.length });
 
   // Dump scrollback buffers and mark live sessions as suspended for recovery
   const managedSessions = sessionManager.listManagedSessions();
   stateWriter.ensureBufferDir();
 
+  const dumpsStart = phaseStartedAt();
   const dumpPromises: Promise<void>[] = [];
   for (const managed of managedSessions) {
     if (managed.meta.state === 'dead') continue;
@@ -963,29 +1032,37 @@ async function shutdown(
   await Promise.all(dumpPromises);
   // A4 — async dumps are durable. Sync exit handler will short-circuit.
   dumpsCompleted = true;
+  phaseLog('bufferDumps', dumpsStart, { count: dumpPromises.length });
 
   // Save suspended state BEFORE disposing
   if (!cachedBootId) cachedBootId = await getBootId();
+  const stateSaveStart = phaseStartedAt();
   const suspendState: DaemonState = {
     version: 1,
     sessions: managedSessions.map((m) => ({ ...m.meta })),
     bootId: cachedBootId,
   };
   stateWriter.saveImmediate(suspendState);
+  phaseLog('stateSave', stateSaveStart, { sessions: managedSessions.length });
 
   // Dispose all sessions (kills PTYs, clears map)
+  const disposeStart = phaseStartedAt();
+  const disposedCount = sessionManager.listManagedSessions().length;
   sessionManager.disposeAll();
+  phaseLog('disposeAll', disposeStart, { count: disposedCount });
 
   stateWriter.dispose();
 
   // Stop IPC server — skipped when the caller (e.g., daemon.shutdown RPC)
   // still needs the pipe to flush its ack.
   if (!opts.skipPipeStop) {
+    const pipeServerStopStart = phaseStartedAt();
     await pipeServer.stop().catch(() => {});
+    phaseLog('pipeServerStop', pipeServerStopStart);
   }
 
   releaseLock();
-  log('info', 'Daemon stopped');
+  log('info', `Daemon stopped (total shutdown ${Date.now() - shutdownStartedAt}ms)`);
 
   // Clear the hard-timeout guard now that shutdown has reached its end.
   // Without this, the timer would still fire after a skipExit deferral if
