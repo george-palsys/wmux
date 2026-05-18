@@ -25,6 +25,8 @@ import { registerBrowserRpc } from './pipe/handlers/browser.rpc';
 import { registerA2aRpc } from './pipe/handlers/a2a.rpc';
 import { registerCompanyRpc } from './pipe/handlers/company.rpc';
 import { registerEventsRpc } from './pipe/handlers/events.rpc';
+import { registerMcpPluginRpc } from './pipe/handlers/mcp.rpc';
+import { getPluginTrustStore } from './mcp/PluginTrustStore';
 import { ClaudeWorker } from './a2a/ClaudeWorker';
 import { AutoUpdater } from './updater/AutoUpdater';
 import { McpRegistrar } from './mcp/McpRegistrar';
@@ -330,6 +332,18 @@ registerBrowserRpc(rpcRouter, () => mainWindow, webviewCdpManager);
 registerA2aRpc(rpcRouter, () => mainWindow, claudeWorker);
 registerCompanyRpc(rpcRouter, () => mainWindow);
 registerEventsRpc(rpcRouter);
+registerMcpPluginRpc(rpcRouter);
+
+// Wire the legacy-contact bookkeeping so envelope-less RPCs land in
+// plugin-trust.json as a `legacy` audit entry, per spec §2.2.
+// fire-and-forget — the recorder must never affect dispatch latency.
+rpcRouter.setLegacyContactRecorder(() => {
+  void getPluginTrustStore()
+    .upsertLegacyContact()
+    .catch(() => {
+      /* trust-store writes are best-effort; never block RPC */
+    });
+});
 
 // IPC: webview CDP registration
 ipcMain.handle('browser:register-webview', async (_event, surfaceId: string, webContentsId: number) => {
